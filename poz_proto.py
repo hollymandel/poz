@@ -5,7 +5,7 @@ import heapq
 import weakref
 import contextvars
 from typing import Optional
-
+import time
 
 _TARGET_REF: Optional[weakref.ReferenceType[asyncio.Task]]  = None
 
@@ -21,6 +21,7 @@ PENALIZE_ONCE = weakref.WeakKeyDictionary()
 
 _poz_flag = contextvars.ContextVar("poz_flag", default=False)
 _gate_armed_event = asyncio.Event()
+_gate_bypass = contextvars.ContextVar("poz_gate_bypass", default=False)
 
 def _unwrap(cb):
     while isinstance(cb, functools.partial):
@@ -55,8 +56,11 @@ class PozLoop(asyncio.SelectorEventLoop):
         self.poz_DELAY = delay
 
         def _factory(loop_, coro):
+            # If caller is in a bypass context, don't gate
+            if _gate_bypass.get(False):
+                return asyncio.Task(coro, loop=loop_)
+            # Otherwise, gate the task *if* a barrier is armed at first step
             async def starter():
-                # If a gate is armed when this task takes its first step, wait for it.
                 barrier = getattr(loop_, "_poz_barrier", None)
                 if barrier is not None:
                     await barrier
@@ -134,19 +138,25 @@ class PozLoop(asyncio.SelectorEventLoop):
                 h._run()
             h = None  # drop ref
 
+    def run_until_complete(self, *args, **kwargs):
+        start_time = time.time()
+        outputs = super().run_until_complete(*args, **kwargs)
+        print(f"Poz Loop Elapsed time: {time.time() - start_time:0.4f} s")
+        return outputs
+
+
 def _arm_gate(loop: "PozLoop", delta: float) -> asyncio.Future:
-    # Arm only if no active barrier; otherwise leave the current one.
+    """Arm the gate for delta seconds if not already armed; return the barrier Future."""
     if loop._poz_barrier is None or loop._poz_barrier.done():
         barrier = loop.create_future()
-        timer = loop.call_later(delta, barrier.set_result, None)  # opens gate after Δ
+        timer = loop.call_later(delta, barrier.set_result, None)  # open after Δ
         loop._poz_barrier = barrier
         loop._poz_timer = timer
     return loop._poz_barrier  # type: ignore
 
 def _cleanup_gate(loop: "PozLoop", barrier: asyncio.Future) -> None:
-    """Clear pointers once THIS barrier has opened."""
+    """Clear loop references once THIS barrier opens."""
     if getattr(loop, "_poz_barrier", None) is barrier:
-        # timer has fired (or will be no-op); clear references
         loop._poz_barrier = None
         t = getattr(loop, "_poz_timer", None)
         if t is not None:
@@ -154,8 +164,12 @@ def _cleanup_gate(loop: "PozLoop", barrier: asyncio.Future) -> None:
             except Exception: pass
         loop._poz_timer = None
 
-
 def poz_target(func):
+    """When the target starts:
+       - delay next resume of tasks already holding (your PENALIZE_ONCE),
+       - arm a gate for poz_DELAY seconds that blocks NEW non-bypass tasks,
+       - allow tasks created by the target (and its subtasks) to bypass the gate.
+    """
     if not asyncio.iscoroutinefunction(func):
         raise TypeError("@poz_target must decorate an async def")
 
@@ -165,25 +179,29 @@ def poz_target(func):
         this = asyncio.current_task()
         if this is None:
             raise RuntimeError("@poz_target must run inside a Task")
-
         _set_target(this)
+
         loop: PozLoop = asyncio.get_running_loop()  # type: ignore
 
-        # (A) one-shot delay for tasks already "holding"
+        # (A) one-shot delay for tasks that are already "holding"
         holding_others = _snapshot_holding_tasks(exclude=this)
         for t in holding_others:
             PENALIZE_ONCE[t] = True
         print(f"[poz] snapshot holding tasks: {len(holding_others)} to delay once")
 
-        # (B) gate the LAUNCH of new tasks for poz_DELAY
+        # (B) Arm the gate for Δ seconds (it stays up even if target finishes early)
         barrier = _arm_gate(loop, loop.poz_DELAY)
         barrier.add_done_callback(lambda _f: _cleanup_gate(loop, barrier))
 
+        # (C) Allow the target (and anything it spawns) to bypass the gate
+        bypass_tok = _gate_bypass.set(True)
         try:
             return await func(*args, **kwargs)
         finally:
+            _gate_bypass.reset(bypass_tok)   # new tasks outside target won't bypass
             _poz_flag.reset(token)
             if _get_target() is this:
                 _set_target(None)
             PENALIZE_ONCE.clear()
+            # NOTE: do NOT close the barrier here; timer will open it at Δ
     return wrapper
