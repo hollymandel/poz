@@ -16,13 +16,13 @@ async def other(name):
     print(f"{name} done")
 
 def main():
-    loop = PozLoop()
+    loop = PozLoop(delay=1.0)
     asyncio.set_event_loop(loop)
     try:
         async def _runner():
-            t1 = asyncio.create_task(target())
             t2 = asyncio.create_task(other("A"))
             t3 = asyncio.create_task(other("B"))
+            t1 = asyncio.create_task(target())
             await asyncio.gather(t1, t2, t3)
         loop.run_until_complete(_runner())
     finally:

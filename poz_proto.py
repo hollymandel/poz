@@ -69,7 +69,7 @@ class PozLoop(asyncio.SelectorEventLoop):
 
         self.set_task_factory(_factory)
 
-    # Intercept resumes WHEN THEY ARE SCHEDULED.
+    # Intercept any state affecting task WHEN THEY ARE SCHEDULED.
     def call_soon(self, callback, *args, context=None):
         t = _task_from_callback(callback)
         target = _get_target()
@@ -144,6 +144,92 @@ class PozLoop(asyncio.SelectorEventLoop):
         print(f"Poz Loop Elapsed time: {time.time() - start_time:0.4f} s")
         return outputs
 
+def _should_delay(task):
+    return task in PENALIZE_ONCE and task is not _get_target()
+
+# ── 1.  Scheduling  ───────────────────────────────────────────
+
+_orig_call_soon = asyncio.BaseEventLoop._call_soon
+def _call_soon_shim(self, cb, *a, context=None, **kw):
+    print("second one")
+    task = asyncio.current_task(loop=self)
+    if task and _should_delay(task):
+        PENALIZE_ONCE.discard(task)
+        return self.call_later(self.poz_DELAY, cb, *a, context=context, **kw)
+    return _orig_call_soon(self, cb, *a, **kw)
+asyncio.BaseEventLoop._call_soon = _call_soon_shim
+
+_orig_call_soon_ts = asyncio.BaseEventLoop.call_soon_threadsafe
+def _call_soon_ts_shim(self, cb, *a, **kw):
+    task = asyncio.current_task(loop=self)
+    if task and _should_delay(task):
+        PENALIZE_ONCE.discard(task)
+        return self.call_later(self.poz_DELAY, cb, *a, **kw)
+    return _orig_call_soon_ts(self, cb, *a, **kw)
+asyncio.BaseEventLoop.call_soon_threadsafe = _call_soon_ts_shim
+
+_orig_run_in_exec = asyncio.BaseEventLoop.run_in_executor
+async def _run_in_exec_shim(self, exec_, func, *a):
+    task = asyncio.current_task(loop=self)
+    if task and _should_delay(task):
+        PENALIZE_ONCE.discard(task)
+        await asyncio.sleep(self.poz_DELAY)
+    return await _orig_run_in_exec(self, exec_, func, *a)
+asyncio.BaseEventLoop.run_in_executor = _run_in_exec_shim
+
+# ── 2.  Lock  / Semaphore  / Queue  ──────────────────────────
+
+def _wrap_acquire(cls):
+    orig = cls.acquire
+    async def acquire(self, *a, **k):
+        task = asyncio.current_task()
+        if task and _should_delay(task):
+            PENALIZE_ONCE.discard(task)
+            await asyncio.sleep(self._loop.poz_DELAY)
+        return await orig(self, *a, **k)
+    cls.acquire = acquire
+    return cls
+
+def _wrap_release(cls):
+    orig = cls.release
+    def release(self, *a, **k):
+        task = asyncio.current_task()
+        if task and _should_delay(task):
+            PENALIZE_ONCE.discard(task)
+            self._loop.call_later(self._loop.poz_DELAY, orig, self, *a, **k)
+        else:
+            orig(self, *a, **k)
+    cls.release = release
+    return cls
+
+def _patch_lock_sem_queue():
+    # Lock
+    asyncio.Lock = _wrap_release(_wrap_acquire(asyncio.Lock))
+
+    # Semaphore
+    asyncio.Semaphore = _wrap_release(_wrap_acquire(asyncio.Semaphore))
+
+    # Queue (put / get)
+    q_cls = asyncio.Queue
+    orig_put = q_cls.put
+    orig_get = q_cls.get
+
+    async def put(self, item):
+        task = asyncio.current_task()
+        if task and _should_delay(task):
+            PENALIZE_ONCE.discard(task)
+            await asyncio.sleep(self._loop.poz_DELAY)
+        return await orig_put(self, item)
+    async def get(self):
+        task = asyncio.current_task()
+        if task and _should_delay(task):
+            PENALIZE_ONCE.discard(task)
+            await asyncio.sleep(self._loop.poz_DELAY)
+        return await orig_get(self)
+
+    q_cls.put, q_cls.get = put, get
+
+_patch_lock_sem_queue()
 
 def _arm_gate(loop: "PozLoop", delta: float) -> asyncio.Future:
     """Arm the gate for delta seconds if not already armed; return the barrier Future."""
