@@ -69,22 +69,6 @@ class PozLoop(asyncio.SelectorEventLoop):
 
         self.set_task_factory(_factory)
 
-    # Intercept any state affecting task WHEN THEY ARE SCHEDULED.
-    def call_soon(self, callback, *args, context=None):
-        t = _task_from_callback(callback)
-        target = _get_target()
-        if t is not None and t in PENALIZE_ONCE and t is not target:
-            # divert this FIRST resume into the near future, once
-            handle = super().call_later(self.poz_DELAY, callback, *args, context=context)
-            # consume the one-shot mark
-            try:
-                del PENALIZE_ONCE[t]
-            except KeyError:
-                pass
-            print(f"[poz] one-shot delay via call_soon: task={id(t)} delay={self.poz_DELAY}")
-            return handle
-        return super().call_soon(callback, *args, context=context)
-
     # Safety net: if any marked task is already in ready, delay it once and consume.
     def _poz_sweep_ready_once(self):
         if not getattr(self, "_ready", None) or not PENALIZE_ONCE:

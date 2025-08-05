@@ -18,11 +18,16 @@ async def other(name):
 def main():
     loop = PozLoop(delay=1.0)
     asyncio.set_event_loop(loop)
+    lock = asyncio.Lock()
     try:
         async def _runner():
-            t2 = asyncio.create_task(other("A"))
-            t3 = asyncio.create_task(other("B"))
-            t1 = asyncio.create_task(target())
+            
+            async with lock:
+                t3 = asyncio.create_task(other("B"))
+            async with lock:
+                t1 = asyncio.create_task(target())
+            async with lock:
+                t2 = asyncio.create_task(other("A"))
             await asyncio.gather(t1, t2, t3)
         loop.run_until_complete(_runner())
     finally:
