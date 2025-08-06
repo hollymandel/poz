@@ -1,9 +1,10 @@
-from poz_proto import poz_target, PozLoop
+from poz_proto import  PozLoop
 import asyncio
 import time
 
-@poz_target
+# @poz_target
 async def target():
+    PozLoop.virtual_speedup()
     for i in range(3):
         print("target tick", i)
         await asyncio.sleep(0.05)
@@ -21,7 +22,6 @@ def main():
     lock = asyncio.Lock()
     try:
         async def _runner():
-            
             async with lock:
                 t3 = asyncio.create_task(other("B"))
             async with lock:
