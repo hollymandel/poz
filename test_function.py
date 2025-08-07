@@ -17,7 +17,7 @@ async def other(name):
     print(f"{name} done")
 
 def main():
-    loop = PozLoop(delay=1.0)
+    loop = PozLoop()
     asyncio.set_event_loop(loop)
     lock = asyncio.Lock()
     try:
