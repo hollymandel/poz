@@ -4,14 +4,15 @@ import time
 
 # @poz_target
 async def target():
-    PozLoop.virtual_speedup()
+    
     for i in range(3):
         print("target tick", i)
+        PozLoop.virtual_speedup()
         await asyncio.sleep(0.05)
     print("target done")
 
 async def other(name):
-    for i in range(3):
+    for i in range(1):
         print(f"{name} tick", i)
         await asyncio.sleep(0.05)
     print(f"{name} done")
@@ -19,15 +20,12 @@ async def other(name):
 def main():
     loop = PozLoop()
     asyncio.set_event_loop(loop)
-    lock = asyncio.Lock()
     try:
         async def _runner():
-            async with lock:
-                t3 = asyncio.create_task(other("B"))
-            async with lock:
-                t1 = asyncio.create_task(target())
-            async with lock:
-                t2 = asyncio.create_task(other("A"))
+            
+            t1 = asyncio.create_task(target())
+            t3 = asyncio.create_task(other("B"))
+            t2 = asyncio.create_task(other("A"))
             await asyncio.gather(t1, t2, t3)
         loop.run_until_complete(_runner())
     finally:
