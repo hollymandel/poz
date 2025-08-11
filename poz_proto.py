@@ -183,6 +183,7 @@ class PozLoop(asyncio.SelectorEventLoop):
                 pass
             self.log.append(PozLoopLogEvent(record_dict))
             print(record_dict)
+            print("\n\n\n\n")
         
     def run_until_complete(self, *args, **kwargs):
         start_time = time.time()
