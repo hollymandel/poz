@@ -1,5 +1,7 @@
 import asyncio
 from poz_proto import PozLoop  # assuming PozLoop is your custom event loop
+import pickle
+import pdb
 
 # Simulate longer-running process A
 async def process_a(i):
@@ -22,11 +24,14 @@ async def main():
         await process_a(i)
 
 if __name__ == "__main__":
-    loop = PozLoop()
+    loop = PozLoop(record=True)
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(main())
     finally:
-        pass
+        # pdb.set_trace()
+        with open("save_log.pkl", "wb") as f:
+            pickle.dump(loop.log, f)
+        print("log is saved")
         # print("trying to close loop")
         # loop.close()

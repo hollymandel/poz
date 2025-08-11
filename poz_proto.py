@@ -4,9 +4,17 @@ import functools
 import heapq
 import weakref
 import contextvars
-from typing import Optional
+from typing import Optional, Dict, List
 import time
 import sys
+from poz_logger import (
+    PozOwnerMixin,
+    CURRENT_OWNER_TID,
+    describe_ready_deque,
+    describe_scheduled_heap,
+    describe_event_list,
+    describe_task_list,
+)
 
 # Avoid proactor loop on windows machine
 if sys.platform == "win32":
@@ -55,12 +63,28 @@ def _snapshot_concurrent_tasks(exclude: Optional[asyncio.Task] = None):
 def _count_tasks():
     return 1#len(asyncio.all_tasks())
 
+class PozLoopLogEvent():
+    def __init__(self, data: Dict):
+        self.data = data
+
+class PozLoopLog():
+    def __init__(self):
+        self.data = []
+
+    def append(self, event: PozLoopLogEvent):
+        self.data.append(event)
+
 class PozLoop(asyncio.SelectorEventLoop):
-    def __init__(self, delay=1.0, *a, **k):
+    def __init__(self, delay=1.0, record=False, *a, **k):
         super().__init__(*a, **k)
         self._poz_barrier: Optional[asyncio.Future] = None
         self._poz_timer = None
         self.poz_DELAY = delay
+        self.record = record
+        self._poz_task_index = {}
+        
+        if record:
+            self.log = PozLoopLog()
 
         def _factory(loop_, coro):
             if _gate_bypass.get(False):
@@ -69,8 +93,8 @@ class PozLoop(asyncio.SelectorEventLoop):
             async def starter():
                 barrier = getattr(loop_, "_poz_barrier", None)
 
-                # ⬇ NEW: if this task is already in PENALIZE_ONCE, don’t gate it —
-                #        it will pay its one-shot delay later via the shim.
+                # If this task is already in PENALIZE_ONCE, don’t gate it —
+                # it will pay its one-shot delay later via the shim.
                 myself = asyncio.current_task()
                 if barrier is not None and myself not in PENALIZE_ONCE:
                     await barrier
@@ -102,9 +126,13 @@ class PozLoop(asyncio.SelectorEventLoop):
         self._ready = new_ready
 
     def _run_once(self):
-        # --- timeout selection (standard) ---
+        record_dict = {} if getattr(self, "record", False) else None
+
+        # --- timeout selection ---
         if self._ready:
             timeout = 0
+            if record_dict is not None:
+                record_dict["ready"] = describe_ready_deque(self._ready, self._poz_task_index, limit=200)
         elif self._scheduled:
             timeout = max(0, self._scheduled[0]._when - self.time())
         else:
@@ -112,26 +140,50 @@ class PozLoop(asyncio.SelectorEventLoop):
 
         # --- poll I/O ---
         event_list = self._selector.select(timeout)
+        if record_dict is not None:
+            record_dict["event_list"] = describe_event_list(event_list, limit=500)
+
         self._process_events(event_list)
 
         # --- move due timers -> ready ---
         now = self.time()
+        if record_dict is not None:
+            record_dict["scheduled"] = describe_scheduled_heap(self._scheduled, self._poz_task_index, limit=500)
         while self._scheduled and self._scheduled[0]._when <= now:
             h = heapq.heappop(self._scheduled)
             if not getattr(h, "_cancelled", False):
                 self._ready.append(h)
 
-        # --- our one-shot sweep (only affects marked tasks) ---
+        # --- remove to-pause tasks from ready ---
         self._poz_sweep_ready_once()
+        if record_dict is not None:
+            record_dict["new_ready"] = describe_ready_deque(self._ready, self._poz_task_index, limit=200)
 
         # --- run ready snapshot ---
         ntodo = len(self._ready)
         for _ in range(ntodo):
             h = self._ready.popleft()
             if not getattr(h, "_cancelled", False):
-                h._run()
-            h = None  # drop ref
+                # ensure callbacks run under their stamped owner context
+                owner = getattr(h, "_poz_owner_tid", None)
+                tok = None
+                if owner is not None:
+                    tok = CURRENT_OWNER_TID.set(owner)
+                try:
+                    h._run()
+                finally:
+                    if tok is not None:
+                        CURRENT_OWNER_TID.reset(tok)
+            h = None
 
+        if record_dict is not None:
+            try:
+                record_dict["tasks"] = describe_task_list(asyncio.all_tasks())
+            except Exception:
+                pass
+            self.log.append(PozLoopLogEvent(record_dict))
+            print(record_dict)
+        
     def run_until_complete(self, *args, **kwargs):
         start_time = time.time()
         outputs = super().run_until_complete(*args, **kwargs)
