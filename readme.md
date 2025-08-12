@@ -7,23 +7,33 @@ Poz assumes that the target function (the function that experiences a virtual sp
 
 ### Examples
 
-The following examples demonstrate capabilities and limitations of Poz. See `/test` for implementations of these examples. 
+The following examples demonstrate capabilities and limitations of Poz. See `/test` for implementations.
 1. **The Non-Rate Limiting Step**: `F` and `G` are IO-bound functions. `F` runs several times in sequence, and each time it calls `G` once before it returns. If a pause is placed in `G` before `F` is allowed to return, then Poz will delay the return of each `F`, so the program will slow down by `delta` times the number of iterations. If the pause is placed in `F` after `G` is allowed to return, the PozLoop will force `F` to take an async pause of size `delta` before its next return, so the effect is the same. This accurately reflects the fact that optimizing `G` will not improve the runtime of the program, since it is constrained by the serial runtime of `F`.
 2. **The Rate Limiting Step**: On the other hand, if a virtual speedup is in placed in `F`, runtime will be unaffected, accurately reflecting the fact that the serial runtime of `F` is limiting runtime. 
 3. **The CPU Bound Workload**: `F` and `G` are CPU-bound functions that trade off access to a single thread. A virtual speedup placed in either function will not affect the runtime of the program, but only give the target function exclusive access to the thread during the pause period. This accurately reflects that fact that optimizing the runtime of either function will increase the runtime.
-4. **The rate-limited external API**: The target function `F` and a concurrent function `G` compete to call an external API that will only process one request at a time. Say `F` is given a virtual speedup while `G` holds the resource for additional time. This is misleading, because `Poz` cannot prevent `G` from releasing external resources. However, speeding `F` at this point will not make `G` return any faster. Therefore the runtime of the program will not increase, incorrectly suggesting that optimizing `F` at this point will improve performance. 
-5. **Asyncio Lock**: The target function `F` and a concurrent function `G` compete to acquire an asyncio lock. Say `F` is given a virtual speedup while `G` holds the lock. Poz will impose a delay on `G` before it is able to release the lock. Therefore the runtime of the program will increase, correctly reflecting that optimizing `F` at this point will not improve performance.
+4. **The Rate-Limited External API**: The target function `F` and a concurrent function `G` compete to call an external API that will only process one request at a time. Say `F` is given a virtual speedup while `G` holds the resource for additional time. This is misleading, because `Poz` cannot prevent `G` from releasing external resources. However, speeding `F` at this point will not make `G` return any faster. Therefore the runtime of the program will not increase, incorrectly suggesting that optimizing `F` at this point will improve performance. 
+5. **The Asyncio Lock**: The target function `F` and a concurrent function `G` compete to acquire an asyncio lock. Say `F` is given a virtual speedup while `G` holds the lock. Poz will impose a delay on `G` before it is able to release the lock. Therefore the runtime of the program will increase, correctly reflecting that optimizing `F` at this point will not improve performance.
+6. **The Surprise**: Critical path contention--speeding up a line slows the overall runtime!
 
 ### Implementation
    
-The pause/virtual speedup is implemented as follows. An event loop subclass, `PozLoop`, is created. A virtual speedup is placed within the target function: `PozLoop.virtual_speedup(delta)`. Then, the `PozLoop` is used in place of the default event loop to run the tasks (e.g. `pozloop.run_until_complete()`). 
+The pause/virtual speedup is implemented as follows. An event loop subclass, `PozLoop`, is instantiated. A virtual speedup is placed within the target function: `PozLoop.virtual_speedup(delta)`. Then, the `PozLoop` is used in place of the default event loop to run the tasks (e.g. `pozloop.run_until_complete()`). 
 
 When the target function is called inside a PozLoop, other functions are delayed by `delta`. This means that
 1. Any work already in the `_ready` queue is rescheduled with a delay of `delta`, unless it originates from the target function.
 2. Any function running concurrently when the virtual speedup is encountered will suffer a `delta` delay the next time it tries to execute any callback, i.e. the callback will be rescheduled with a delay of `delta`.
-2. For a period `delta` starting from when the function is called, no new asynchronous tasks can be launched. 
+3. For a period `delta` starting from when the function is called, no new asynchronous tasks can be launched. 
 
 Thus concurrent functions experience a pause equivalent to an `asyncio.sleep(delta)` the next time they try to affect the event loop. This may come after `delta` time has passed from the virtual speedup, which is why Poz is limited in scope to event loop-mediated interactions.  
+
+### Limitations
+
+Poz assumes that the important interactions between coroutines are mediated by the event loop. See "the rate-limited external API" for an example failure case. 
+
+Poz does not control for the overhead of rescheduling tasks, etc. This overhead is on the order of ????. Therefore Poz cannot reliably detect effects on this time scale.
+
+Python program runtimes are noisy. (Is this true rel other languages?) Multiple experiments may be needed to resolve small effects, and results may be influenced by other processes (is this true? GIL? multi thread CPU?)
+
 
 TODO: 
 - profiler/visibility
