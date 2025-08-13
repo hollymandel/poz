@@ -60,9 +60,6 @@ def _snapshot_concurrent_tasks(exclude: Optional[asyncio.Task] = None):
         out.append(t)
     return out
 
-def _count_tasks():
-    return 1#len(asyncio.all_tasks())
-
 class PozLoopLogEvent():
     def __init__(self, data: Dict):
         self.data = data
@@ -115,12 +112,12 @@ class PozLoop(asyncio.SelectorEventLoop):
             t = _task_from_handle(h)
             target = _get_target()
             if t is not None and t in PENALIZE_ONCE and t is not target:
-                super().call_later(self.poz_DELAY/_count_tasks(), h._run)
+                super().call_later(self.poz_DELAY, h._run)
                 try:
                     del PENALIZE_ONCE[t]
                 except KeyError:
                     pass
-                print(f"[poz] one-shot delay from ready: task={id(t)} delay={self.poz_DELAY/_count_tasks()}")
+                print(f"[poz] one-shot delay from ready: task={id(t)} delay={self.poz_DELAY}")
             else:
                 new_ready.append(h)
         self._ready = new_ready
@@ -242,7 +239,7 @@ def _call_soon_shim(self, cb, *a, context=None, **kw):
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
         PENALIZE_ONCE.discard(task)
-        return self.call_later(self.poz_DELAY/_count_tasks(), cb, *a, context=context, **kw)
+        return self.call_later(self.poz_DELAY, cb, *a, context=context, **kw)
     return _orig_call_soon(self, cb, *a, **kw)
 asyncio.BaseEventLoop._call_soon = _call_soon_shim
 
@@ -251,7 +248,7 @@ def _call_soon_ts_shim(self, cb, *a, **kw):
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
         PENALIZE_ONCE.discard(task)
-        return self.call_later(self.poz_DELAY/_count_tasks(), cb, *a, **kw)
+        return self.call_later(self.poz_DELAY, cb, *a, **kw)
     return _orig_call_soon_ts(self, cb, *a, **kw)
 asyncio.BaseEventLoop.call_soon_threadsafe = _call_soon_ts_shim
 
@@ -260,7 +257,7 @@ async def _run_in_exec_shim(self, exec_, func, *a):
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
         PENALIZE_ONCE.discard(task)
-        await asyncio.sleep(self.poz_DELAY/_count_tasks())
+        await asyncio.sleep(self.poz_DELAY)
     return await _orig_run_in_exec(self, exec_, func, *a)
 asyncio.BaseEventLoop.run_in_executor = _run_in_exec_shim
 
@@ -272,7 +269,7 @@ def _wrap_acquire(cls):
         task = asyncio.current_task()
         if task and _should_delay(task):
             PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY/_count_tasks())
+            await asyncio.sleep(self._loop.poz_DELAY)
         return await orig(self, *a, **k)
     cls.acquire = acquire
     return cls
@@ -305,13 +302,13 @@ def _patch_lock_sem_queue():
         task = asyncio.current_task()
         if task and _should_delay(task):
             PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY/_count_tasks())
+            await asyncio.sleep(self._loop.poz_DELAY)
         return await orig_put(self, item)
     async def get(self):
         task = asyncio.current_task()
         if task and _should_delay(task):
             PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY/_count_tasks())
+            await asyncio.sleep(self._loop.poz_DELAY)
         return await orig_get(self)
 
     q_cls.put, q_cls.get = put, get
