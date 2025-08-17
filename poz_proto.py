@@ -7,6 +7,9 @@ import contextvars
 from typing import Optional
 import time
 import sys
+import sys, asyncio
+from contextlib import contextmanager
+
 
 # Avoid proactor loop on windows machine
 if sys.platform == "win32":
@@ -54,6 +57,28 @@ def _snapshot_concurrent_tasks(exclude: Optional[asyncio.Task] = None):
 
 def _count_tasks():
     return 1#len(asyncio.all_tasks())
+
+
+@contextmanager
+def PozPolicy():
+    """Temporarily make asyncio create PozLoop() (with given delay)."""
+    prev = asyncio.get_event_loop_policy()
+
+    base = (asyncio.WindowsSelectorEventLoopPolicy
+            if sys.platform == "win32"
+            else asyncio.DefaultEventLoopPolicy)
+
+    class _PozPolicy(base):  # type: ignore[misc]
+        def new_event_loop(self):
+            return PozLoop()
+
+    asyncio.set_event_loop_policy(_PozPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(prev)
+
+
 
 class PozLoop(asyncio.SelectorEventLoop):
     def __init__(self, *a, **k):
@@ -131,7 +156,6 @@ class PozLoop(asyncio.SelectorEventLoop):
     def run_until_complete(self, *args, **kwargs):
         start_time = time.time()
         outputs = super().run_until_complete(*args, **kwargs)
-        print(f"Poz Loop Elapsed time: {time.time() - start_time:0.4f} s")
         return outputs
 
     def _virtual_speedup(self, delta: Optional[float] = None) -> None:

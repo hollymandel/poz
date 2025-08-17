@@ -1,13 +1,13 @@
 import asyncio
 import sys
 sys.path.append("/Users/hollymandel/poz")
-from poz_proto import PozLoop
+from poz_proto import PozLoop, PozPolicy
 import time 
 
 async def F():
     await asyncio.sleep(0.1)
 
-    delta = 30
+    delta = 1
     print(f"virtual speedup in F CPU work of size {delta}")
     PozLoop.virtual_speedup(delta)
 
@@ -39,25 +39,21 @@ async def H(lock):
         print("H released lock")
 
 
-
-def main():
-    loop = PozLoop(delay=5.0)
-    asyncio.set_event_loop(loop)
+async def main():
     lock = asyncio.Lock()
-
-    async def _runner():
-        f = asyncio.create_task(F())
-        g = asyncio.create_task(G(lock))
-        h = asyncio.create_task(H(lock))
-        await asyncio.gather(f,g,h)
-
-    loop.run_until_complete(_runner())
-    loop.close()
+    f = asyncio.create_task(F())
+    g = asyncio.create_task(G(lock))
+    h = asyncio.create_task(H(lock))
+    await asyncio.gather(f,g,h)
 
 if __name__ == "__main__":
     try:
-        # start = time.time()
-        main()
-        # print(f"Elapsed time: {time.time()-start:0.2f}s")
+        start_time = time.time()
+        loop = PozLoop()
+
+        with PozPolicy():
+            asyncio.run(main())
+
+        print(f"Poz Loop Elapsed time: {time.time() - start_time:0.4f} s")
     finally:
-        pass
+        loop.close()
