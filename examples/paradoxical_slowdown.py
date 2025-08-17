@@ -14,7 +14,7 @@ async def process_a(i, lock, start_time):
         await asyncio.sleep(1)
     print(f"[dt = {time.time()-start_time:0.2f}] A{i} released the lock")
     await asyncio.sleep(5)
-    
+
     await process_a(i+1, lock, start_time)
     
 async def process_b(i, lock, start_time):
@@ -29,7 +29,6 @@ async def process_b(i, lock, start_time):
     ## Expection runtime with pause: 19s (+6s for poz delays, +1s for slowdown)
     print(f"[dt = {time.time()-start_time:0.2f}] B{i} speedup, A will be delayed in releasing/acquiring lock for 3s")
     PozLoop.virtual_speedup(3)
-
     await asyncio.sleep(3)
 
     async with lock:
@@ -41,7 +40,7 @@ async def process_b(i, lock, start_time):
 
 def main():
     loop = PozLoop()
-    asyncio.set_event_loop(loop)
+    
     lock = asyncio.Lock()
     start_time = time.time()
 
@@ -55,6 +54,8 @@ def main():
 
 if __name__ == "__main__":
     try:
+        start_time = time.time()
         main()
+        print(f"Poz Loop Elapsed time: {time.time() - start_time:0.4f} s")
     finally:
         pass

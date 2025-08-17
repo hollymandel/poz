@@ -18,7 +18,9 @@ The following examples demonstrate capabilities and limitations of Poz. In all c
 
 ### Implementation
    
-The pause/virtual speedup is implemented as follows. An event loop subclass, `PozLoop`, is instantiated. A virtual speedup is placed within the target function: `PozLoop.virtual_speedup(delta)`. Then, the `PozLoop` is used in place of the default event loop to run the tasks (e.g. `pozloop.run_until_complete()`). 
+The pause/virtual speedup is implemented as follows. An event loop subclass, `PozLoop`, is instantiated. A virtual speedup is placed within the target function: `PozLoop.virtual_speedup(delta)`. Then, the `PozLoop` is used in place of the default event loop to run the tasks. To do this, you can either call `asyncio.run` from within `PozPolicy()` context, or just call `pozloop.run_until_complete()`:
+
+```code example block here```
 
 When the target function is called inside a PozLoop, other functions are delayed by `delta`. This means that
 1. Any work already in the `_ready` queue is rescheduled with a delay of `delta`, unless it originates from the target function.

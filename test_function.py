@@ -7,8 +7,8 @@ async def target():
     
     for i in range(3):
         print("target tick", i)
-        PozLoop.virtual_speedup()
-        await asyncio.sleep(0.05)
+        PozLoop.virtual_speedup(1)
+        await asyncio.sleep(1)
     print("target done")
 
 async def other(name):

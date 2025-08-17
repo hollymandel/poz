@@ -9,7 +9,22 @@ import time
 import sys
 import sys, asyncio
 from contextlib import contextmanager
+import sys, inspect
 
+def _poz_callsite_key():
+    """
+    Return a stable key for the *user* call site of virtual_speedup():
+    (filename, lineno, funcname, bytecode_offset)
+    """
+    modfile = sys.modules[PozLoop.__module__].__file__  # our module file
+    f = sys._getframe(1)  # caller of PozLoop.virtual_speedup (classmethod)
+    # Walk up until we leave our own module (handles classmethod -> instance hop)
+    while f and f.f_code.co_filename == modfile:
+        f = f.f_back
+    if f is None:  # fallback
+        f = sys._getframe(1)
+    c = f.f_code
+    return (c.co_filename, f.f_lineno, c.co_name, f.f_lasti)
 
 # Avoid proactor loop on windows machine
 if sys.platform == "win32":
@@ -86,6 +101,7 @@ class PozLoop(asyncio.SelectorEventLoop):
         self._poz_barrier: Optional[asyncio.Future] = None
         self._poz_timer = None
         self.poz_DELAY = None
+        self.poz_site = None
 
         def _factory(loop_, coro):
             if _gate_bypass.get(False):
@@ -160,6 +176,15 @@ class PozLoop(asyncio.SelectorEventLoop):
 
     def _virtual_speedup(self, delta: Optional[float] = None) -> None:
         self.poz_DELAY = delta
+
+        # identify calling file/line
+        get_key = _poz_callsite_key()
+        if self.poz_site is None:
+            self.poz_site = get_key
+        else:
+            assert get_key == self.poz_site, "Only one virtual speedup is allowed per experiment"
+
+
         t = asyncio.current_task(loop=self)
         if t is None:
             raise RuntimeError("virtual_speedup() must be called from within a Task")
@@ -167,7 +192,6 @@ class PozLoop(asyncio.SelectorEventLoop):
         _set_target(t)                       # <──  tell the shims who the target is
 
         # default delta
-        d = self.poz_DELAY if delta is None else float(delta)
 
         # 1) mark all *other* live tasks so their *next* state-affecting action is delayed
         for other in _snapshot_concurrent_tasks(exclude=t):
@@ -175,8 +199,7 @@ class PozLoop(asyncio.SelectorEventLoop):
             PENALIZE_ONCE[other] = True
 
         # 2) arm / extend the gate that holds NEW non-bypass tasks
-        barrier = _extend_gate(self, d)
-        # print("extended gate")
+        barrier = _extend_gate(self, self.poz_DELAY)
         barrier.add_done_callback(lambda _f: _cleanup_gate(self, barrier))
 
         # 3) let this task (and anything it spawns) bypass the gate
