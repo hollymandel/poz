@@ -70,10 +70,6 @@ def _snapshot_concurrent_tasks(exclude: Optional[asyncio.Task] = None):
         out.append(t)
     return out
 
-def _count_tasks():
-    return 1#len(asyncio.all_tasks())
-
-
 @contextmanager
 def PozPolicy():
     """Temporarily make asyncio create PozLoop() (with given delay)."""
@@ -196,7 +192,7 @@ class PozLoop(asyncio.SelectorEventLoop):
         # 1) mark all *other* live tasks so their *next* state-affecting action is delayed
         for other in _snapshot_concurrent_tasks(exclude=t):
             # print(f"found other: {other}")
-            PENALIZE_ONCE[other] = True
+            PENALIZE_ONCE[other] = delta
 
         # 2) arm / extend the gate that holds NEW non-bypass tasks
         barrier = _extend_gate(self, self.poz_DELAY)
@@ -225,34 +221,42 @@ def _should_delay(task):
 
 # ── 1.  Scheduling  ───────────────────────────────────────────
 
+
+# --- 1) _call_soon (private) ---
 _orig_call_soon = asyncio.BaseEventLoop._call_soon
-def _call_soon_shim(self, cb, *a, context=None, **kw):
+def _call_soon_shim(self, cb, args, context=None):
+    # args is already a tuple per asyncio internals
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
-        PENALIZE_ONCE.discard(task)
-        return self.call_later(self.poz_DELAY, cb, *a, context=context, **kw)
-    return _orig_call_soon(self, cb, *a, **kw)  # ← keep context
+        if task in PENALIZE_ONCE:
+            del PENALIZE_ONCE[task]
+        # delay via public API, and forward context by keyword
+        return self.call_later(self.poz_DELAY, cb, *args, context=context)
+    return _orig_call_soon(self, cb, args, context)
 asyncio.BaseEventLoop._call_soon = _call_soon_shim
 
+# --- 2) call_soon_threadsafe (public) ---
 _orig_call_soon_ts = asyncio.BaseEventLoop.call_soon_threadsafe
-def _call_soon_ts_shim(self, cb, *a, **kw):
+def _call_soon_ts_shim(self, cb, *args, context=None):
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
-        PENALIZE_ONCE.discard(task)
-        # print(f"Penalizing task {task}")
-        return self.call_later(self.poz_DELAY, cb, *a, **kw)
-    return _orig_call_soon_ts(self, cb, *a, **kw)
+        if task in PENALIZE_ONCE:
+            del PENALIZE_ONCE[task]
+        return self.call_later(self.poz_DELAY, cb, *args, context=context)
+    return _orig_call_soon_ts(self, cb, *args, context=context)
 asyncio.BaseEventLoop.call_soon_threadsafe = _call_soon_ts_shim
 
+# --- 3) run_in_executor ---
 _orig_run_in_exec = asyncio.BaseEventLoop.run_in_executor
-async def _run_in_exec_shim(self, exec_, func, *a):
+async def _run_in_exec_shim(self, exec_, func, *args):
     task = asyncio.current_task(loop=self)
     if task and _should_delay(task):
-        PENALIZE_ONCE.discard(task)
-        # print(f"Penalizing task {task}")
+        if task in PENALIZE_ONCE:
+            del PENALIZE_ONCE[task]
         await asyncio.sleep(self.poz_DELAY)
-    return await _orig_run_in_exec(self, exec_, func, *a)
+    return await _orig_run_in_exec(self, exec_, func, *args)
 asyncio.BaseEventLoop.run_in_executor = _run_in_exec_shim
+
 
 # ── 2.  Lock  / Semaphore  / Queue  ──────────────────────────
 
@@ -261,8 +265,10 @@ def _wrap_acquire(cls):
     async def acquire(self, *a, **k):
         task = asyncio.current_task()
         if task and _should_delay(task):
-            PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY)
+            if task in PENALIZE_ONCE:
+                delay = PENALIZE_ONCE[task]
+                del PENALIZE_ONCE[task]
+            await asyncio.sleep(delay)
         return await orig(self, *a, **k)
     cls.acquire = acquire
     return cls
@@ -272,8 +278,10 @@ def _wrap_release(cls):
     def release(self, *a, **k):
         task = asyncio.current_task()
         if task and _should_delay(task):
-            PENALIZE_ONCE.discard(task)
-            self._loop.call_later(self._loop.poz_DELAY, orig, self, *a, **k)
+            if task in PENALIZE_ONCE:
+                delay = PENALIZE_ONCE[task]
+                del PENALIZE_ONCE[task]
+            self._loop.call_later(delay, orig, self, *a, **k)
         else:
             orig(self, *a, **k)
     cls.release = release
@@ -294,14 +302,18 @@ def _patch_lock_sem_queue():
     async def put(self, item):
         task = asyncio.current_task()
         if task and _should_delay(task):
-            PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY)
+            if task in PENALIZE_ONCE:
+                delay = PENALIZE_ONCE[task]
+                del PENALIZE_ONCE[task]
+            await asyncio.sleep(delay)
         return await orig_put(self, item)
     async def get(self):
         task = asyncio.current_task()
         if task and _should_delay(task):
-            PENALIZE_ONCE.discard(task)
-            await asyncio.sleep(self._loop.poz_DELAY)
+            if task in PENALIZE_ONCE:
+                delay = PENALIZE_ONCE[task]
+                del PENALIZE_ONCE[task]
+            await asyncio.sleep(delay)
         return await orig_get(self)
 
     q_cls.put, q_cls.get = put, get
