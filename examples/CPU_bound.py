@@ -24,7 +24,7 @@ async def process_b(i):
 
     start_time = time.time()
 
-    PozLoop.virtual_speedup(3) # comment/uncomment - runtime of ~6s unaffected
+    await PozLoop.virtual_speedup(3) # comment/uncomment - runtime of ~6s unaffected
     for _ in range(12):
         sum([x**2 for x in range(1_000_000)])
         await asyncio.sleep(0)

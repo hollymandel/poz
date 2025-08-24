@@ -207,14 +207,17 @@ class PozLoop(asyncio.SelectorEventLoop):
             if _get_target() is t:
                 _set_target(None)
 
-        t.add_done_callback(_on_done)     
+        t.add_done_callback(_on_done)    
+        
 
     @classmethod
-    def virtual_speedup(cls, delta = 1.0):
+    async def virtual_speedup(cls, delta = 1.0):
         loop = asyncio.get_running_loop()
         if not isinstance(loop, cls):
             raise RuntimeError("virtual_speedup_here: running loop is not a PozLoop")
         loop._virtual_speedup(delta)
+        await asyncio.sleep(0) # allow rescheduling to happen *now*
+        
 
 def _should_delay(task):
     return task in PENALIZE_ONCE and task is not _get_target()

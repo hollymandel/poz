@@ -28,7 +28,7 @@ async def process_b(i, lock, start_time):
     ## Expected runtime without pause: 12s
     ## Expection runtime with pause: 19s (+6s for poz delays, +1s for slowdown)
     print(f"[dt = {time.time()-start_time:0.2f}] B{i} speedup, A will be delayed in releasing/acquiring lock for 3s")
-    PozLoop.virtual_speedup(3)
+    await PozLoop.virtual_speedup(3)
     await asyncio.sleep(3)
 
     async with lock:
@@ -40,7 +40,7 @@ async def process_b(i, lock, start_time):
 
 def main():
     loop = PozLoop()
-    
+
     lock = asyncio.Lock()
     start_time = time.time()
 

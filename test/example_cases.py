@@ -211,32 +211,48 @@ def test_paradoxical_slowdown():
     assert 0.95 < (dt_speedup/1.9) < 1.05
     
     
-# # 4) rate_limiting_example.py → A triggers B; verify causality (B after A completion).
-# @pytest.mark.timeout(3)
-# def test_rate_limiting_trigger_after_A(capfd):
-#     async def process_b(i):
-#         await asyncio.sleep(0)
-#         print(f"B{i} start")
-#         await asyncio.sleep(0.02)
-#         print(f"B{i} done")
+# 4) rate_limiting_example.py: 
+def test_rate_limiting():
+    async def process_a(i, a_speedup=False, b_speedup=False):
+        print(f"A{i} start")
+        print(f"Launching B{i}")
+        asyncio.create_task(process_b(i, b_speedup))
+        await asyncio.sleep(0)
+        if a_speedup:
+            await PozLoop.virtual_speedup(0.1)
+        print("awaiting A")
+        await asyncio.sleep(0.2)
+        print(f"A{i} done")
 
-#     async def process_a(i):
-#         print(f"A{i} start")
-#         PozLoop.virtual_speedup(0.02)
-#         await asyncio.sleep(0.02)
-#         print(f"A{i} done — kicking off B{i}")
-#         await process_b(i)
+    async def process_b(i, b_speedup):
+        print(f"B{i} start")
+        if b_speedup:
+            print(f"B{i} speedup")
+            await PozLoop.virtual_speedup(0.1)
+        await asyncio.sleep(0.1)
+        print(f"B{i} done")
 
-#     async def main():
-#         await process_a(0)
+    async def main(speedup_a, speedup_b):
+        start = time.perf_counter()
+        for i in range(3):
+            await process_a(0, speedup_a, speedup_b)
+        print("\n\n\n")
+        return  time.perf_counter() - start
 
-#     run_with_poz(main())
-#     out, _ = capfd.readouterr()
-#     lines = [ln.strip() for ln in out.splitlines()]
-#     # Ensure A announces completion before B starts.
-#     a_done_idx = next(i for i, ln in enumerate(lines) if "A0 done — kicking off B0" in ln)
-#     b_start_idx = next(i for i, ln in enumerate(lines) if "B0 start" in ln)
-#     assert a_done_idx < b_start_idx
+    no_speedup_dt = run_with_poz(main(False, False))
+    a_speedup_dt = run_with_poz(main(True, False))
+    b_speedup_dt = run_with_poz(main(True, False))
+
+    print(no_speedup_dt)
+    print(a_speedup_dt)
+    print(b_speedup_dt)
+
+    a_speedup_ratio = a_speedup_dt / no_speedup_dt
+    b_speedup_ratio = b_speedup_dt / no_speedup_dt
+
+    assert 0.95 < a_speedup_ratio < 1.05
+    assert False
+    
 
 
 # # 5) suspended_thread.py → F applies virtual speedup during CPU work; verify it does not

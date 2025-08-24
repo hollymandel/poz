@@ -10,7 +10,7 @@ import time
 async def process_a(i):
     print(f"A{i} start")
 
-    PozLoop.virtual_speedup(0)
+    await PozLoop.virtual_speedup(3)
     await asyncio.sleep(2)  
     print(f"A{i} done — kicking off B{i}")
 

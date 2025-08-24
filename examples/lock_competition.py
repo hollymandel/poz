@@ -6,19 +6,24 @@ import time
 
 async def F(lock):
     await asyncio.sleep(0)
-    PozLoop.virtual_speedup(2)
-    for i in range(10):
+    # PozLoop.virtual_speedup(2)
+    for i in range(1):
         async with lock:
+            await PozLoop.virtual_speedup(1) 
             print(f"F has the lock, iteration {i}")
-            sum([x**2 for x in range(1_000_000)])
+            start = time.time()
+            sum([x**2 for x in range(10_000_000)])
+            print(f"{time.time()-start:0.2f}")
             await asyncio.sleep(0)
 
 async def G(lock):
     await asyncio.sleep(0)
-    for i in range(10):
+    print("G launched")
+    for i in range(1):
+        # await PozLoop.virtual_speedup(1) 
         async with lock:
             print(f"G has the lock, iteration {i}")
-            sum([x**2 for x in range(1_000_000)])
+            sum([x**2 for x in range(10_000_000)])
             await asyncio.sleep(0)
 
 # async def main():
