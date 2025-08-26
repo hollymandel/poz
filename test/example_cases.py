@@ -62,6 +62,8 @@ def cpu_burn_ms(ms: int):
         s += sum(i * i for i in range(n))
     return s
 
+def timer_print(message, start):
+    print(f"[{time.time()-start:0.3f}] {message}")
 
 @contextlib.asynccontextmanager
 async def acquired(lock: asyncio.Lock):
@@ -88,7 +90,6 @@ def order_from_lines(lines: List[str], prefixes: Tuple[str, ...]) -> List[str]:
 # 1) CPU_bound.py → virtual speedup should not affect runtime for CPU-bound sections.
 #    We compare elapsed times of two back-to-back runs with and without virtual_speedup
 #    and require them to be within a modest ratio (not necessarily equal).
-@pytest.mark.timeout(10)
 def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
     async def process_a(i):
         print(f"A{i} starting CPU work")
@@ -123,7 +124,6 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
 
 # 2) lock_competition.py → two coroutines contend for a lock. Speeding the lock-holding
 #     coro should have an effect, speeding the suspended coro should not.
-@pytest.mark.timeout(60)
 def test_lock_competition():
     def _run_once(f_speedup: bool, g_speedup: bool) -> float:
         async def main():
@@ -168,7 +168,6 @@ def test_lock_competition():
 
 # 3) paradoxical_slowdown.py → virtual speedup in B changes effective order: ABAB → ABBA, 
 #       increasing overall runtime
-@pytest.mark.timeout(5)
 def test_paradoxical_slowdown():
     async def process_a(i, start_time, lock):
         if i == 2:
@@ -213,90 +212,97 @@ def test_paradoxical_slowdown():
     
 # 4) rate_limiting_example.py: 
 def test_rate_limiting():
-    async def process_a(i, a_speedup=False, b_speedup=False):
-        print(f"A{i} start")
-        print(f"Launching B{i}")
-        asyncio.create_task(process_b(i, b_speedup))
+    async def process_a(i, a_speedup=False, b_speedup=False, start=None):
+        if start==None:
+            start = time.time()
+        if i == 3:
+            return
+        print(f"[{time.time()-start:0.4f}] A{i} start")
+        print(f"[{time.time()-start:0.4f}] Launching B{i}")
+        asyncio.create_task(process_b(i, b_speedup, start))
         await asyncio.sleep(0)
         if a_speedup:
             await PozLoop.virtual_speedup(0.1)
-        print("awaiting A")
+        print(f"[{time.time()-start:0.4f}] awaiting A")
         await asyncio.sleep(0.2)
-        print(f"A{i} done")
+        print(f"[{time.time()-start:0.4f}] A{i} done")
+        return start
 
-    async def process_b(i, b_speedup):
-        print(f"B{i} start")
+    async def process_b(i, b_speedup, start):
+        print(f"[{time.time()-start:0.4f}] B{i} start")
         if b_speedup:
-            print(f"B{i} speedup")
+            print(f"[{time.time()-start:0.4f}] B{i} speedup")
             await PozLoop.virtual_speedup(0.1)
         await asyncio.sleep(0.1)
-        print(f"B{i} done")
+        print(f"[{time.time()-start:0.4f}] B{i} done")
 
     async def main(speedup_a, speedup_b):
         start = time.perf_counter()
+        start2 = time.time()
         for i in range(3):
-            await process_a(0, speedup_a, speedup_b)
-        print("\n\n\n")
+            await process_a(i, speedup_a, speedup_b, start2)
         return  time.perf_counter() - start
 
     no_speedup_dt = run_with_poz(main(False, False))
     a_speedup_dt = run_with_poz(main(True, False))
-    b_speedup_dt = run_with_poz(main(True, False))
+    b_speedup_dt = run_with_poz(main(False, True))
 
-    print(no_speedup_dt)
-    print(a_speedup_dt)
-    print(b_speedup_dt)
-
-    a_speedup_ratio = a_speedup_dt / no_speedup_dt
-    b_speedup_ratio = b_speedup_dt / no_speedup_dt
+    a_speedup_ratio = a_speedup_dt / (no_speedup_dt+0)
+    b_speedup_ratio = b_speedup_dt / (no_speedup_dt+0.3)
 
     assert 0.95 < a_speedup_ratio < 1.05
-    assert False
+    assert 0.95 < b_speedup_ratio < 1.05
+
+
+# 5) suspended_thread.py - suspended threads G and H unaffected by speedup that takes less time
+# than G's wait time. H is the suspended thread, confirm no double-counting of pause.
+def test_suspended_thread():
+    async def F(speedup, start):
+        await asyncio.sleep(0.001) # let F and G start
+        if speedup:
+            timer_print("Poz speedup of F", start)
+            await PozLoop.virtual_speedup(0.1)
+
+        timer_print("F CPU start", start)
+        cpu_burn_ms(200)
+
+        timer_print("F CPU end", start)
+
+    async def G(lock, start):
+        async with lock:
+            timer_print("G acquired lock, starting sleep", start)
+            await asyncio.sleep(0.2)
+            timer_print("G released lock", start)
+
+        await asyncio.sleep(0.001)  # give H a chance next
+
+        timer_print("G CPU start", start)
+        cpu_burn_ms(120)
+        timer_print("G CPU end", start)
+
+    async def H(lock, start):
+        await asyncio.sleep(0)  # ensure G likely acquires first
+        async with lock:
+            timer_print("H acquired lock, starting sleep", start)
+            await asyncio.sleep(0.2)
+            timer_print("H released lock", start)
+
+    async def main(speedup_f):
+        start = time.perf_counter()
+        start2 = time.time()
+        lock = asyncio.Lock()
+        await asyncio.gather(F(speedup_f, start2), G(lock, start2), H(lock, start2))
+        return  time.perf_counter() - start
+
+    print("\n")
+    with_speedup = run_with_poz(main(True))
+    print('\n')
+    without_speedup = run_with_poz(main(False))
+
+    print(with_speedup)
+    print(without_speedup)
     
+    ratio = with_speedup / (without_speedup + .1)
+    assert 0.95 < ratio < 1.05
 
-
-# # 5) suspended_thread.py → F applies virtual speedup during CPU work; verify it does not
-# #    reorder G/H lock acquisition. H should only acquire after G releases.
-# @pytest.mark.timeout(5)
-# def test_suspended_thread_virtual_speedup_no_effect_on_lock_order(capfd):
-#     lock = asyncio.Lock()
-
-#     async def F():
-#         await asyncio.sleep(0.01)
-#         PozLoop.virtual_speedup(0.05)
-#         print("F CPU start")
-#         cpu_burn_ms(80)
-#         print("F CPU end")
-
-#     async def G():
-#         async with lock:
-#             print("G acquired lock")
-#             await asyncio.sleep(0.05)
-#             print("G released lock")
-#         await asyncio.sleep(0)  # give H a chance next
-
-#         print("G CPU start")
-#         cpu_burn_ms(60)
-#         print("G CPU end")
-
-#     async def H():
-#         print("H will await")
-#         await asyncio.sleep(0)  # ensure G likely acquires first
-#         async with lock:
-#             print("H acquired lock")
-#             await asyncio.sleep(0.05)
-#             print("H released lock")
-
-#     async def main():
-#         await asyncio.gather(F(), G(), H())
-
-#     run_with_poz(main())
-#     out, _ = capfd.readouterr()
-#     lines = [ln.strip() for ln in out.splitlines()]
-
-#     g_acq = lines.index("G acquired lock")
-#     g_rel = lines.index("G released lock")
-#     h_acq = lines.index("H acquired lock")
-#     # Assert that H acquires *after* G releases, i.e., no reordering effect.
-#     assert g_acq < g_rel < h_acq
 

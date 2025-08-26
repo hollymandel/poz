@@ -7,9 +7,20 @@ import contextvars
 from typing import Optional
 import time
 import sys
-import sys, asyncio
 from contextlib import contextmanager
-import sys, inspect
+import inspect
+
+# ─────────────────────────────────────────────────────────────
+# Capture ORIGINAL asyncio primitives BEFORE monkey-patching
+# ─────────────────────────────────────────────────────────────
+_ORIG_Lock = asyncio.Lock
+_ORIG_Semaphore = asyncio.Semaphore
+_ORIG_BoundedSemaphore = asyncio.BoundedSemaphore
+_ORIG_Queue = asyncio.Queue
+
+# ─────────────────────────────────────────────────────────────
+# Callsite fingerprint (unchanged)
+# ─────────────────────────────────────────────────────────────
 
 def _poz_callsite_key():
     """
@@ -18,7 +29,6 @@ def _poz_callsite_key():
     """
     modfile = sys.modules[PozLoop.__module__].__file__  # our module file
     f = sys._getframe(1)  # caller of PozLoop.virtual_speedup (classmethod)
-    # Walk up until we leave our own module (handles classmethod -> instance hop)
     while f and f.f_code.co_filename == modfile:
         f = f.f_back
     if f is None:  # fallback
@@ -30,23 +40,15 @@ def _poz_callsite_key():
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-
 _TARGET_REF: Optional[weakref.ReferenceType[asyncio.Task]]  = None
-
 def _get_target():
     return _TARGET_REF() if _TARGET_REF else None
 def _set_target(t: Optional[asyncio.Task]):
     global _TARGET_REF
     _TARGET_REF = weakref.ref(t) if t is not None else None
 
-# Map of tasks that should be delayed exactly once → True
-# WeakKeyDictionary so tasks don’t get kept alive.
-PENALIZE_ONCE = weakref.WeakKeyDictionary()
-
 _poz_flag = contextvars.ContextVar("poz_flag", default=False)
-_gate_armed_event = asyncio.Event()
 _gate_bypass = contextvars.ContextVar("poz_gate_bypass", default=False)
-
 
 def _unwrap(cb):
     while isinstance(cb, functools.partial):
@@ -66,15 +68,13 @@ def _snapshot_concurrent_tasks(exclude: Optional[asyncio.Task] = None):
     for t in asyncio.all_tasks():
         if t is exclude or t.done():
             continue
-        # Include all tasks that aren't done — these are "live"
         out.append(t)
     return out
 
 @contextmanager
 def PozPolicy():
-    """Temporarily make asyncio create PozLoop() (with given delay)."""
+    """Temporarily make asyncio create PozLoop()."""
     prev = asyncio.get_event_loop_policy()
-
     base = (asyncio.WindowsSelectorEventLoopPolicy
             if sys.platform == "win32"
             else asyncio.DefaultEventLoopPolicy)
@@ -89,7 +89,202 @@ def PozPolicy():
     finally:
         asyncio.set_event_loop_policy(prev)
 
+# ─────────────────────────────────────────────────────────────
+# Public-only sleep shim so we can stretch timers cleanly
+# ─────────────────────────────────────────────────────────────
 
+_ORIG_SLEEP = asyncio.sleep
+
+# Track: future -> (handle, deadline_time)
+_SLEEP_FUT_STATE = {}
+# Track: task -> its current sleep future (if any)
+_TASK_SLEEP_FUT = weakref.WeakKeyDictionary()
+
+async def _poz_sleep(delay, result=None):
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    delay = max(0.0, float(delay))
+    deadline = loop.time() + delay
+
+    def _set():
+        if not fut.done():
+            fut.set_result(result)
+
+    handle = loop.call_later(delay, _set)
+    _SLEEP_FUT_STATE[fut] = (handle, deadline)
+
+    task = asyncio.current_task()
+    if task:
+        _TASK_SLEEP_FUT[task] = fut
+
+    try:
+        return await fut
+    finally:
+        st = _SLEEP_FUT_STATE.pop(fut, None)
+        if st is not None:
+            h, _ = st
+            try: h.cancel()
+            except Exception: pass
+        if task and _TASK_SLEEP_FUT.get(task) is fut:
+            try: del _TASK_SLEEP_FUT[task]
+            except Exception: pass
+
+# Install shim
+asyncio.sleep = _poz_sleep  # type: ignore[assignment]
+
+def _extend_task_sleep(task: asyncio.Task, loop: asyncio.AbstractEventLoop, extra_ms: float) -> bool:
+    """Extend this task's *current* sleep by extra_ms (ms). Returns True if extended."""
+    if extra_ms <= 0: return False
+    fut = _TASK_SLEEP_FUT.get(task)
+    if fut is None or fut.done():
+        return False
+    st = _SLEEP_FUT_STATE.get(fut)
+    if st is None:
+        return False
+    handle, deadline = st
+    now = loop.time()
+    remaining = max(0.0, deadline - now)
+    try:
+        handle.cancel()
+    except Exception:
+        pass
+    new_deadline = now + remaining + (extra_ms / 1000.0)
+
+    def _set():
+        if not fut.done():
+            fut.set_result(None)
+
+    new_handle = loop.call_later(remaining + (extra_ms / 1000.0), _set)
+    _SLEEP_FUT_STATE[fut] = (new_handle, new_deadline)
+    return True
+
+# ─────────────────────────────────────────────────────────────
+# Endorser + proxy-from-task pattern for user-space primitives
+# ─────────────────────────────────────────────────────────────
+
+class PozEndorserMixin:
+    """
+    Carries not-before time (NB) in loop.time() units; consumed at handoff.
+    Also registers each instance so virtual_speedup can apply tax to all live endorsers.
+    """
+    _poz_registry = weakref.WeakSet()
+
+    def __init__(self):
+        self._poz_nb = 0.0
+        PozEndorserMixin._poz_registry.add(self)
+
+    def poz_tax(self, delta_ms: float):
+        loop = asyncio.get_running_loop()
+        self._poz_nb = max(self._poz_nb, loop.time() + (delta_ms / 1000.0))
+
+    def poz_not_before(self) -> float:
+        return self._poz_nb
+
+    def poz_consume(self):
+        self._poz_nb = 0.0
+
+def _poz_proxy_from_task(task: asyncio.Task, *, endorser, loop: asyncio.AbstractEventLoop):
+    """
+    Create a 'proxy' Future that completes with the same outcome as 'task',
+    but not before endorser.poz_not_before(). Consumes the NB on completion.
+    Cancelling the proxy cancels the task.
+    """
+    proxy = loop.create_future()
+
+    def _complete():
+        if proxy.done():
+            return
+        if task.cancelled():
+            proxy.cancel()
+        else:
+            exc = task.exception()
+            if exc is not None:
+                proxy.set_exception(exc)
+            else:
+                proxy.set_result(task.result())
+        consume = getattr(endorser, "poz_consume", None)
+        if callable(consume):
+            consume()
+
+    def _task_done(_):
+        now = loop.time()
+        nb = float(getattr(endorser, "poz_not_before", lambda: 0.0)())
+        remain = max(0.0, nb - now)
+        if remain <= 0.0:
+            _complete()
+        else:
+            loop.call_later(remain, _complete)
+
+    task.add_done_callback(_task_done)
+
+    def _proxy_done(p):
+        if p.cancelled() and not task.done():
+            task.cancel()
+    proxy.add_done_callback(_proxy_done)
+
+    return proxy
+
+# Lock wrapper: delegate to original; delay completion via proxy
+class PozLock(PozEndorserMixin, _ORIG_Lock):  # type: ignore[misc]
+    def __init__(self, *a, **kw):
+        _ORIG_Lock.__init__(self, *a, **kw)
+        PozEndorserMixin.__init__(self)
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        inner_task = loop.create_task(_ORIG_Lock.acquire(self))  # call original
+        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
+        await proxy
+        return True
+
+# Semaphore wrappers
+class PozSemaphore(PozEndorserMixin, _ORIG_Semaphore):  # type: ignore[misc]
+    def __init__(self, *a, **kw):
+        _ORIG_Semaphore.__init__(self, *a, **kw)
+        PozEndorserMixin.__init__(self)
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        inner_task = loop.create_task(_ORIG_Semaphore.acquire(self))
+        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
+        await proxy
+        return True
+
+class PozBoundedSemaphore(PozSemaphore, _ORIG_BoundedSemaphore):  # type: ignore[misc]
+    def __init__(self, *a, **kw):
+        _ORIG_BoundedSemaphore.__init__(self, *a, **kw)
+        PozSemaphore.__init__(self, *a, **kw)
+
+# Queue (get/put may suspend): delegate and proxy
+class PozQueue(PozEndorserMixin, _ORIG_Queue):  # type: ignore[misc]
+    def __init__(self, *a, **kw):
+        _ORIG_Queue.__init__(self, *a, **kw)
+        PozEndorserMixin.__init__(self)
+
+    async def get(self):
+        loop = asyncio.get_running_loop()
+        inner_task = loop.create_task(_ORIG_Queue.get(self))
+        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
+        return await proxy
+
+    async def put(self, item):
+        loop = asyncio.get_running_loop()
+        inner_task = loop.create_task(_ORIG_Queue.put(self, item))
+        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
+        await proxy
+        return None
+
+def _patch_lock_sem_queue():
+    asyncio.Lock = PozLock
+    asyncio.Semaphore = PozSemaphore
+    asyncio.BoundedSemaphore = PozBoundedSemaphore
+    asyncio.Queue = PozQueue
+
+_patch_lock_sem_queue()
+
+# ─────────────────────────────────────────────────────────────
+# Poz event loop (no private scheduling shims)
+# ─────────────────────────────────────────────────────────────
 
 class PozLoop(asyncio.SelectorEventLoop):
     def __init__(self, *a, **k):
@@ -104,38 +299,15 @@ class PozLoop(asyncio.SelectorEventLoop):
                 return asyncio.Task(coro, loop=loop_)
             async def starter():
                 barrier = getattr(loop_, "_poz_barrier", None)
-                myself = asyncio.current_task()
-                if barrier is not None and myself not in PENALIZE_ONCE:
+                if barrier is not None:
                     await barrier
                 return await coro
             return asyncio.Task(starter(), loop=loop_)
 
-        self.set_task_factory(_factory)   # ← you lost this line
-
-    # Safety net: if any marked task is already in ready, delay it once and consume.
-    def _poz_sweep_ready_once(self):
-        if not getattr(self, "_ready", None) or not PENALIZE_ONCE:
-            return
-        new_ready = collections.deque()
-        while self._ready:
-            h = self._ready.popleft()
-            if getattr(h, "_cancelled", False):
-                continue
-            t = _task_from_handle(h)
-            target = _get_target()
-            if t is not None and t in PENALIZE_ONCE and t is not target:
-                super().call_later(self.poz_DELAY, h._run)
-                try:
-                    del PENALIZE_ONCE[t]
-                except KeyError:
-                    pass
-                print(f"[poz] one-shot delay from ready: task={id(t)} delay={self.poz_DELAY}")
-            else:
-                new_ready.append(h)
-        self._ready = new_ready
+        self.set_task_factory(_factory)
 
     def _run_once(self):
-        # --- timeout selection (standard) ---
+        # vanilla run_once
         if self._ready:
             timeout = 0
         elif self._scheduled:
@@ -143,21 +315,15 @@ class PozLoop(asyncio.SelectorEventLoop):
         else:
             timeout = None
 
-        # --- poll I/O ---
         event_list = self._selector.select(timeout)
         self._process_events(event_list)
 
-        # --- move due timers -> ready ---
         now = self.time()
         while self._scheduled and self._scheduled[0]._when <= now:
             h = heapq.heappop(self._scheduled)
             if not getattr(h, "_cancelled", False):
                 self._ready.append(h)
 
-        # --- our one-shot sweep (only affects marked tasks) ---
-        self._poz_sweep_ready_once()
-
-        # --- run ready snapshot ---
         ntodo = len(self._ready)
         for _ in range(ntodo):
             h = self._ready.popleft()
@@ -165,50 +331,48 @@ class PozLoop(asyncio.SelectorEventLoop):
                 h._run()
             h = None  # drop ref
 
-    def run_until_complete(self, *args, **kwargs):
-        start_time = time.time()
-        outputs = super().run_until_complete(*args, **kwargs)
-        return outputs
-
     def _virtual_speedup(self, delta: Optional[float] = None) -> None:
-        self.poz_DELAY = delta
+        self.poz_DELAY = float(delta)
 
-        # identify calling file/line
+        # identify calling file/line; enforce single site (your policy)
         get_key = _poz_callsite_key()
         if self.poz_site is None:
             self.poz_site = get_key
         else:
             assert get_key == self.poz_site, "Only one virtual speedup is allowed per experiment"
 
-
         t = asyncio.current_task(loop=self)
         if t is None:
             raise RuntimeError("virtual_speedup() must be called from within a Task")
 
-        _set_target(t)                       # <──  tell the shims who the target is
+        _set_target(t)
 
-        # default delta
+        # For each OTHER task:
+        #  - If suspended on *our* sleep → extend timer by Δ
+        for other in (x for x in asyncio.all_tasks(loop=self) if x is not t and not x.done()):
+            _extend_task_sleep(other, self, self.poz_DELAY * 1000.0)
 
-        # 1) mark all *other* live tasks so their *next* state-affecting action is delayed
-        for other in _snapshot_concurrent_tasks(exclude=t):
-            # print(f"found other: {other}")
-            PENALIZE_ONCE[other] = delta
+        # Raise NB on all known endorsers (locks/semaphores/queues)
+        for endorser in list(PozEndorserMixin._poz_registry):
+            try:
+                endorser.poz_tax(self.poz_DELAY * 1000.0)
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
 
-        # 2) arm / extend the gate that holds NEW non-bypass tasks
+        # Arm / extend the gate that holds NEW non-bypass tasks
         barrier = _extend_gate(self, self.poz_DELAY)
         barrier.add_done_callback(lambda _f: _cleanup_gate(self, barrier))
 
-        # 3) let this task (and anything it spawns) bypass the gate
+        # let this task (and anything it spawns) bypass the gate
         _gate_bypass.set(True)
 
-        # 4) when this task finishes, clear target + bypass
+        # When this task finishes, clear target
         def _on_done(_fut):
-            PENALIZE_ONCE.clear()          # ← nothing left to delay
             if _get_target() is t:
                 _set_target(None)
-
-        t.add_done_callback(_on_done)    
-        
+        t.add_done_callback(_on_done)
 
     @classmethod
     async def virtual_speedup(cls, delta = 1.0):
@@ -217,111 +381,10 @@ class PozLoop(asyncio.SelectorEventLoop):
             raise RuntimeError("virtual_speedup_here: running loop is not a PozLoop")
         loop._virtual_speedup(delta)
         await asyncio.sleep(0) # allow rescheduling to happen *now*
-        
 
-def _should_delay(task):
-    return task in PENALIZE_ONCE and task is not _get_target()
-
-# ── 1.  Scheduling  ───────────────────────────────────────────
-
-
-# --- 1) _call_soon (private) ---
-_orig_call_soon = asyncio.BaseEventLoop._call_soon
-def _call_soon_shim(self, cb, args, context=None):
-    # args is already a tuple per asyncio internals
-    task = asyncio.current_task(loop=self)
-    if task and _should_delay(task):
-        if task in PENALIZE_ONCE:
-            del PENALIZE_ONCE[task]
-        # delay via public API, and forward context by keyword
-        return self.call_later(self.poz_DELAY, cb, *args, context=context)
-    return _orig_call_soon(self, cb, args, context)
-asyncio.BaseEventLoop._call_soon = _call_soon_shim
-
-# --- 2) call_soon_threadsafe (public) ---
-_orig_call_soon_ts = asyncio.BaseEventLoop.call_soon_threadsafe
-def _call_soon_ts_shim(self, cb, *args, context=None):
-    task = asyncio.current_task(loop=self)
-    if task and _should_delay(task):
-        if task in PENALIZE_ONCE:
-            del PENALIZE_ONCE[task]
-        return self.call_later(self.poz_DELAY, cb, *args, context=context)
-    return _orig_call_soon_ts(self, cb, *args, context=context)
-asyncio.BaseEventLoop.call_soon_threadsafe = _call_soon_ts_shim
-
-# --- 3) run_in_executor ---
-_orig_run_in_exec = asyncio.BaseEventLoop.run_in_executor
-async def _run_in_exec_shim(self, exec_, func, *args):
-    task = asyncio.current_task(loop=self)
-    if task and _should_delay(task):
-        if task in PENALIZE_ONCE:
-            del PENALIZE_ONCE[task]
-        await asyncio.sleep(self.poz_DELAY)
-    return await _orig_run_in_exec(self, exec_, func, *args)
-asyncio.BaseEventLoop.run_in_executor = _run_in_exec_shim
-
-
-# ── 2.  Lock  / Semaphore  / Queue  ──────────────────────────
-
-def _wrap_acquire(cls):
-    orig = cls.acquire
-    async def acquire(self, *a, **k):
-        task = asyncio.current_task()
-        if task and _should_delay(task):
-            if task in PENALIZE_ONCE:
-                delay = PENALIZE_ONCE[task]
-                del PENALIZE_ONCE[task]
-            await asyncio.sleep(delay)
-        return await orig(self, *a, **k)
-    cls.acquire = acquire
-    return cls
-
-def _wrap_release(cls):
-    orig = cls.release
-    def release(self, *a, **k):
-        task = asyncio.current_task()
-        if task and _should_delay(task):
-            if task in PENALIZE_ONCE:
-                delay = PENALIZE_ONCE[task]
-                del PENALIZE_ONCE[task]
-            self._loop.call_later(delay, orig, self, *a, **k)
-        else:
-            orig(self, *a, **k)
-    cls.release = release
-    return cls
-
-def _patch_lock_sem_queue():
-    # Lock
-    asyncio.Lock = _wrap_release(_wrap_acquire(asyncio.Lock))
-
-    # Semaphore
-    asyncio.Semaphore = _wrap_release(_wrap_acquire(asyncio.Semaphore))
-
-    # Queue (put / get)
-    q_cls = asyncio.Queue
-    orig_put = q_cls.put
-    orig_get = q_cls.get
-
-    async def put(self, item):
-        task = asyncio.current_task()
-        if task and _should_delay(task):
-            if task in PENALIZE_ONCE:
-                delay = PENALIZE_ONCE[task]
-                del PENALIZE_ONCE[task]
-            await asyncio.sleep(delay)
-        return await orig_put(self, item)
-    async def get(self):
-        task = asyncio.current_task()
-        if task and _should_delay(task):
-            if task in PENALIZE_ONCE:
-                delay = PENALIZE_ONCE[task]
-                del PENALIZE_ONCE[task]
-            await asyncio.sleep(delay)
-        return await orig_get(self)
-
-    q_cls.put, q_cls.get = put, get
-
-_patch_lock_sem_queue()
+# ─────────────────────────────────────────────────────────────
+# Gate helpers (unchanged)
+# ─────────────────────────────────────────────────────────────
 
 def _arm_gate(loop: "PozLoop", delta: float) -> asyncio.Future:
     """Arm the gate for delta seconds if not already armed; return the barrier Future."""
@@ -346,12 +409,6 @@ def _extend_gate(loop: "PozLoop", delta: float) -> asyncio.Future:
     """If a gate is active, extend its deadline to 'now + delta'."""
     if loop._poz_barrier is None or loop._poz_barrier.done():
         return _arm_gate(loop, delta)
-    # reschedule the timer later if needed
-    try:
-        remaining = getattr(loop._poz_timer, "_when", None)
-    except Exception:
-        remaining = None
-    # Cancel old timer and set a new one at now+delta if we can’t compare.
     try:
         loop._poz_timer.cancel()
     except Exception:
