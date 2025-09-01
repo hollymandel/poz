@@ -14,32 +14,16 @@ import pytest
 
 import sys
 sys.path.append("/Users/hollymandel/poz")
-try:
-    from poz_proto import PozLoop  # type: ignore
-except Exception as e:  # pragma: no cover - informative failure
-    pytest.skip(f"poz_proto.PozLoop not importable: {e}", allow_module_level=True)
 
-try:
-    from poz_proto import PozPolicy  # type: ignore
-except Exception:
-    PozPolicy = None  # optional
+import poz
 
 
 # ---- Helpers ------------------------------------------------------------------
 
 def run_with_poz(coro: "asyncio.Future"):
     """Run a coroutine to completion on a fresh PozLoop, then flush residual tasks."""
-    loop = PozLoop()
-    try:
-        async def runner():
-            # run the actual test coroutine
-            result = await coro
-            # drain the loop a few turns to flush follow-on callbacks
-            # await drain_loop(3)
-            return result
-        return loop.run_until_complete(runner())
-    finally:
-        loop.close()
+    with poz.poz_context():
+        return asyncio.run(coro)
 
 # async def flush_ready_once():
 #     ev = asyncio.Event()
@@ -98,11 +82,14 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
         print(f"A{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
     async def process_b(i, with_speedup: bool):
+        await asyncio.sleep(0) # ensure A scheduled first
         print(f"B{i} starting CPU work")
         t0 = time.perf_counter()
         if with_speedup:
             # No-op effect on CPU-only sections by design
-            await PozLoop.virtual_speedup(1)  
+            poz.virtual_speedup(1)  
+            await asyncio.sleep(0)
+            print(dict(poz.delayable_handle._poz_ledger))
         cpu_burn_ms(1500)  # ~0.15s
         print(f"B{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
@@ -113,6 +100,7 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
 
     # Run without speedup then with speedup
     t_baseline = run_with_poz(run_pair(False))
+    print("\n\n")
     t_speedup  = run_with_poz(run_pair(True))
 
     # Expect similar durations; allow generous 35% tolerance to reduce flakiness

@@ -18,6 +18,7 @@ async def process_a(i, start_time):
     # await asyncio.sleep(0)
     print_with_time(start_time, f"work starting for A{i}")
     # await asyncio.sleep(0)
+    poz.virtual_speedup(.1)
     await asyncio.sleep(.2)  
     print_with_time(start_time, f"returning for A{i}")
     # await asyncio.sleep(0)
@@ -30,7 +31,7 @@ async def process_a(i, start_time):
 async def process_b(i, start_time):
     print_with_time(start_time, f"B{i} start")
     # PozLoop.virtual_speedup(1)
-    poz.virtual_speedup(.1)
+    # poz.virtual_speedup(.1)
     await asyncio.sleep(.1)
     print_with_time(start_time, f"B{i} done")
 

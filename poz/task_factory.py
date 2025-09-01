@@ -6,9 +6,16 @@ import weakref
 import itertools
 import logging
 
-# TODO: do we need to guard against multiple imports?
-_poz_task_namer = itertools.count()
-_seen_names = set() 
+# Guard against multiple imports: preserve existing registries
+try:  # type: ignore[name-defined]
+    _poz_task_namer  # noqa: F401
+except NameError:  # fresh import or reload without prior state
+    _poz_task_namer = itertools.count()
+
+try:  # type: ignore[name-defined]
+    _seen_names  # noqa: F401
+except NameError:
+    _seen_names = set()
 
 def _create_and_register_name(): 
     name = f"poz-{next(_poz_task_namer)}"
@@ -22,7 +29,7 @@ def _create_and_register_name():
     return name
 
 # TODO: these should live inside the event loop I think?
-_task_ledger = weakref.WeakKeyDictionary()
+# _task_ledger = weakref.WeakKeyDictionary()
 _parent_task_name = contextvars.ContextVar("_parent_task_name", default=False)
 
 def _install_poz_task_factory(loop: Optional[asyncio.AbstractEventLoop] = None):
