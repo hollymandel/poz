@@ -1,6 +1,7 @@
 import asyncio
 from collections import defaultdict
 from .task_factory import _parent_task_name
+from .utils import _poz_cooperative, _poz_suspend_start
 
 _poz_ledger = defaultdict(float)
 _orig_run = None
@@ -21,16 +22,27 @@ def _install_handle_run_shim():
         debt = _poz_ledger[task_id]
 
         try:
-            if debt <= 0:
-                _orig_run(self)
+            if debt > 0:
+                # Cooperative credit: if the last suspension was cooperative, reduce
+                # outstanding debt by real time elapsed since suspension started.
+                coop = self._context.get(_poz_cooperative)
+                remaining = debt
+                if coop:
+                    start = self._context.get(_poz_suspend_start)
+                    if start is not None:
+                        elapsed = max(0.0, self._loop.time() - start)
+                        remaining = max(0.0, debt - elapsed)
+
+                if remaining > 0:
+                    # Reschedule on the same loop this handle belongs to
+                    self._loop.call_later(remaining, self._callback, *self._args, context=self._context)
+                else:
+                    _orig_run(self)
             else:
-                # Reschedule on the same loop this handle belongs to
-                print(f"[Rescheduling {self._callback} for {debt} seconds")
-                self._loop.call_later(debt, self._callback, *self._args, context=self._context)
+                _orig_run(self)
         finally:
-            # Decrement any applied debt for this task. If we didn't reschedule,
-            # debt will be zero and this is a no-op.
-            _poz_ledger[task_id] -= debt
+            # Clear any applied debt for this task (paid by elapsed time or reschedule)
+            _poz_ledger[task_id] = 0.0
 
     asyncio.Handle._run = _run_shim
 
@@ -45,5 +57,4 @@ def _uninstall_handle_run_shim():
         raise AssertionError("Trying to reset Handle._run but stored value is None, this shouldn't occur")
     
     _orig_run = None
-
 
