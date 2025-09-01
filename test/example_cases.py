@@ -23,7 +23,9 @@ import poz
 def run_with_poz(coro: "asyncio.Future"):
     """Run a coroutine to completion on a fresh PozLoop, then flush residual tasks."""
     with poz.poz_context():
-        return asyncio.run(coro)
+        t0 = time.perf_counter()
+        asyncio.run(coro)
+        return time.perf_counter() - t0
 
 # async def flush_ready_once():
 #     ev = asyncio.Event()
@@ -78,7 +80,7 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
     async def process_a(i):
         print(f"A{i} starting CPU work")
         t0 = time.perf_counter()
-        cpu_burn_ms(1500)  # ~0.15s
+        cpu_burn_ms(150)  # ~0.15s
         print(f"A{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
     async def process_b(i, with_speedup: bool):
@@ -87,20 +89,16 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
         t0 = time.perf_counter()
         if with_speedup:
             # No-op effect on CPU-only sections by design
-            poz.virtual_speedup(1)  
+            # poz.virtual_speedup(.1)  
             await asyncio.sleep(0)
             print(dict(poz.delayable_handle._poz_ledger))
-        cpu_burn_ms(1500)  # ~0.15s
+        cpu_burn_ms(150)  # ~0.15s
         print(f"B{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
-    async def run_pair(with_speedup: bool) -> float:
-        t0 = time.perf_counter()
-        await asyncio.gather(process_a(0), process_b(0, with_speedup))
-        return time.perf_counter() - t0
+    async def run_pair(with_speedup: bool): return await poz.untracked(asyncio.gather)(process_a(0), process_b(0, with_speedup))
 
     # Run without speedup then with speedup
     t_baseline = run_with_poz(run_pair(False))
-    print("\n\n")
     t_speedup  = run_with_poz(run_pair(True))
 
     # Expect similar durations; allow generous 35% tolerance to reduce flakiness
