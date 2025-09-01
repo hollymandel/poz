@@ -9,8 +9,6 @@ def _install_handle_run_shim():
     global _orig_run
     _orig_run = asyncio.Handle._run
 
-    loop = asyncio.get_event_loop()
-
     def _run_shim(self):
         debt = _poz_ledger[self._context.get(_parent_task_name)]
 
@@ -19,7 +17,8 @@ def _install_handle_run_shim():
                 _orig_run(self)
             
             else:
-                loop.call_later(debt, self._callback, *self._args, context=self._context)
+                # Reschedule on the same loop this handle belongs to
+                self._loop.call_later(debt, self._callback, *self._args, context=self._context)
         finally:
             _poz_ledger[self._context.get(_parent_task_name)] = 0
 
@@ -36,7 +35,6 @@ def _uninstall_handle_run_shim():
         raise AssertionError("Trying to reset Handle._run but stored value is None, this shouldn't occur")
     
     _orig_run = None
-
 
 
 
