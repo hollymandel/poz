@@ -10,17 +10,27 @@ def _install_handle_run_shim():
     _orig_run = asyncio.Handle._run
 
     def _run_shim(self):
-        debt = _poz_ledger[self._context.get(_parent_task_name)]
+        task_id = self._context.get(_parent_task_name)
+        is_internal = getattr(self._callback, "_poz_internal", False)
+
+        # If we can't attribute this handle to a poz-tracked task, or it's an
+        # internal poz callback (like cleanup), just run it without affecting debt.
+        if not task_id or is_internal:
+            return _orig_run(self)
+
+        debt = _poz_ledger[task_id]
 
         try:
             if debt <= 0:
                 _orig_run(self)
-            
             else:
                 # Reschedule on the same loop this handle belongs to
+                print(f"[Rescheduling {self._callback} for {debt} seconds")
                 self._loop.call_later(debt, self._callback, *self._args, context=self._context)
         finally:
-            _poz_ledger[self._context.get(_parent_task_name)] = 0
+            # Decrement any applied debt for this task. If we didn't reschedule,
+            # debt will be zero and this is a no-op.
+            _poz_ledger[task_id] -= debt
 
     asyncio.Handle._run = _run_shim
 
@@ -35,6 +45,5 @@ def _uninstall_handle_run_shim():
         raise AssertionError("Trying to reset Handle._run but stored value is None, this shouldn't occur")
     
     _orig_run = None
-
 
 

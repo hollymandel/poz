@@ -10,22 +10,27 @@ def print_with_time(start_time, msg):
 # Simulate longer-running process A
 async def process_a(i, start_time):
     await asyncio.sleep(0)
+
     print_with_time(start_time, f"A{i} start")
+    task = asyncio.create_task(process_b(i, start_time)) 
+    print_with_time(start_time, f"kicking off B{i}")
 
-    poz.virtual_speedup(.2)
+    # await asyncio.sleep(0)
+    print_with_time(start_time, f"work starting for A{i}")
+    # await asyncio.sleep(0)
     await asyncio.sleep(.2)  
-    print_with_time(start_time, f"A{i} done — kicking off B{i}")
-
+    print_with_time(start_time, f"returning for A{i}")
+    # await asyncio.sleep(0)
+    return task
     # return asyncio.create_task(process_b(i), name=f"B{i}")
-    return asyncio.create_task(process_b(i, start_time))  # trigger B after A completes
+     # trigger B after A completes
     # await asyncio.sleep(0.01) # take some time to return - time for process B virtual speedup to intercede
 
 # Simulate shorter process B
 async def process_b(i, start_time):
-    await asyncio.sleep(0)
     print_with_time(start_time, f"B{i} start")
     # PozLoop.virtual_speedup(1)
-    # poz.virtual_speedup(.1)
+    poz.virtual_speedup(.1)
     await asyncio.sleep(.1)
     print_with_time(start_time, f"B{i} done")
 

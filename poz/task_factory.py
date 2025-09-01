@@ -54,8 +54,15 @@ def _install_poz_task_factory(loop: Optional[asyncio.AbstractEventLoop] = None):
                 finally:
                     _parent_task_name.reset(tok)
 
-            # clean _seen_names to speed lookups 
-            task.add_done_callback(lambda t: _seen_names.discard(t.get_name()))
+            # clean _seen_names to speed lookups
+            # mark the cleanup callback so the poz handle shim can ignore it
+            def _poz_cleanup_cb(t):
+                _seen_names.discard(t.get_name())
+
+            # Mark as internal so delay shim won't treat it as user work
+            _poz_cleanup_cb._poz_internal = True  # type: ignore[attr-defined]
+
+            task.add_done_callback(_poz_cleanup_cb)
             return task
         except Exception:
             _seen_names.discard(task_id)
