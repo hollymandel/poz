@@ -2,9 +2,8 @@ import asyncio
 from contextlib import contextmanager
 from asyncio import DefaultEventLoopPolicy
 
-from task_factory import _install_poz_task_factory 
-from delayable_handle import _install_handle_run_shim, _uninstall_handle_run_shim 
-
+from .task_factory import _install_poz_task_factory 
+from .delayable_handle import _install_handle_run_shim, _uninstall_handle_run_shim 
 
 class PozPolicy(DefaultEventLoopPolicy):
     def new_event_loop(self):

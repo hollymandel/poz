@@ -11,14 +11,6 @@ from contextlib import contextmanager
 import inspect
 
 # ─────────────────────────────────────────────────────────────
-# Capture ORIGINAL asyncio primitives BEFORE monkey-patching
-# ─────────────────────────────────────────────────────────────
-_ORIG_Lock = asyncio.Lock
-_ORIG_Semaphore = asyncio.Semaphore
-_ORIG_BoundedSemaphore = asyncio.BoundedSemaphore
-_ORIG_Queue = asyncio.Queue
-
-# ─────────────────────────────────────────────────────────────
 # Callsite fingerprint (unchanged)
 # ─────────────────────────────────────────────────────────────
 
@@ -29,6 +21,7 @@ def _poz_callsite_key():
     """
     modfile = sys.modules[PozLoop.__module__].__file__  # our module file
     f = sys._getframe(1)  # caller of PozLoop.virtual_speedup (classmethod)
+    # Walk up until we leave our own module (handles classmethod -> instance hop)
     while f and f.f_code.co_filename == modfile:
         f = f.f_back
     if f is None:  # fallback
@@ -93,6 +86,9 @@ def PozPolicy():
 # Public-only sleep shim so we can stretch timers cleanly
 # ─────────────────────────────────────────────────────────────
 
+# We fully replace asyncio.sleep with a version that uses a Future we own,
+# a TimerHandle we store, and a deadline we track. This lets virtual_speedup
+# extend sleeps without touching private timer internals.
 _ORIG_SLEEP = asyncio.sleep
 
 # Track: future -> (handle, deadline_time)
@@ -103,15 +99,15 @@ _TASK_SLEEP_FUT = weakref.WeakKeyDictionary()
 async def _poz_sleep(delay, result=None):
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    delay = max(0.0, float(delay))
-    deadline = loop.time() + delay
-
+    deadline = loop.time() + max(0.0, float(delay))
     def _set():
         if not fut.done():
             fut.set_result(result)
+            
+    handle = loop.call_later(max(0.0, delay), _set)
 
-    handle = loop.call_later(delay, _set)
-    _SLEEP_FUT_STATE[fut] = (handle, deadline)
+    _sleep_state = (handle, deadline)
+    _SLEEP_FUT_STATE[fut] = _sleep_state
 
     task = asyncio.current_task()
     if task:
@@ -120,6 +116,7 @@ async def _poz_sleep(delay, result=None):
     try:
         return await fut
     finally:
+        # Cleanup regardless of normal wake/cancel
         st = _SLEEP_FUT_STATE.pop(fut, None)
         if st is not None:
             h, _ = st
@@ -134,7 +131,6 @@ asyncio.sleep = _poz_sleep  # type: ignore[assignment]
 
 def _extend_task_sleep(task: asyncio.Task, loop: asyncio.AbstractEventLoop, extra_ms: float) -> bool:
     """Extend this task's *current* sleep by extra_ms (ms). Returns True if extended."""
-    if extra_ms <= 0: return False
     fut = _TASK_SLEEP_FUT.get(task)
     if fut is None or fut.done():
         return False
@@ -149,130 +145,164 @@ def _extend_task_sleep(task: asyncio.Task, loop: asyncio.AbstractEventLoop, extr
     except Exception:
         pass
     new_deadline = now + remaining + (extra_ms / 1000.0)
-
     def _set():
         if not fut.done():
             fut.set_result(None)
-
     new_handle = loop.call_later(remaining + (extra_ms / 1000.0), _set)
     _SLEEP_FUT_STATE[fut] = (new_handle, new_deadline)
     return True
 
 # ─────────────────────────────────────────────────────────────
-# Endorser + proxy-from-task pattern for user-space primitives
+# Endorser + proxy-waiter pattern for user-space primitives
 # ─────────────────────────────────────────────────────────────
 
-class PozEndorserMixin:
+def _poz_proxy_wait(inner: asyncio.Future, *, endorser, loop: asyncio.AbstractEventLoop):
     """
-    Carries not-before time (NB) in loop.time() units; consumed at handoff.
-    Also registers each instance so virtual_speedup can apply tax to all live endorsers.
-    """
-    _poz_registry = weakref.WeakSet()
-
-    def __init__(self):
-        self._poz_nb = 0.0
-        PozEndorserMixin._poz_registry.add(self)
-
-    def poz_tax(self, delta_ms: float):
-        loop = asyncio.get_running_loop()
-        self._poz_nb = max(self._poz_nb, loop.time() + (delta_ms / 1000.0))
-
-    def poz_not_before(self) -> float:
-        return self._poz_nb
-
-    def poz_consume(self):
-        self._poz_nb = 0.0
-
-def _poz_proxy_from_task(task: asyncio.Task, *, endorser, loop: asyncio.AbstractEventLoop):
-    """
-    Create a 'proxy' Future that completes with the same outcome as 'task',
-    but not before endorser.poz_not_before(). Consumes the NB on completion.
-    Cancelling the proxy cancels the task.
+    Return a proxy Future that resolves after 'inner', but no earlier than endorser.poz_not_before().
+    Cancellation is propagated both ways.
     """
     proxy = loop.create_future()
 
-    def _complete():
+    def _complete_proxy_from_inner():
         if proxy.done():
             return
-        if task.cancelled():
+        # propagate inner outcome
+        if inner.cancelled():
             proxy.cancel()
         else:
-            exc = task.exception()
+            exc = inner.exception()
             if exc is not None:
                 proxy.set_exception(exc)
             else:
-                proxy.set_result(task.result())
+                proxy.set_result(inner.result())
+        # consume the NB once handoff is "endorsed"
         consume = getattr(endorser, "poz_consume", None)
         if callable(consume):
             consume()
 
-    def _task_done(_):
+    def _inner_done(_):
         now = loop.time()
         nb = float(getattr(endorser, "poz_not_before", lambda: 0.0)())
         remain = max(0.0, nb - now)
         if remain <= 0.0:
-            _complete()
+            _complete_proxy_from_inner()
         else:
-            loop.call_later(remain, _complete)
+            loop.call_later(remain, _complete_proxy_from_inner)
 
-    task.add_done_callback(_task_done)
+    inner.add_done_callback(_inner_done)
 
+    # If the task cancels the proxy, cancel the inner waiter too
     def _proxy_done(p):
-        if p.cancelled() and not task.done():
-            task.cancel()
+        if p.cancelled() and not inner.done():
+            inner.cancel()
     proxy.add_done_callback(_proxy_done)
 
     return proxy
 
-# Lock wrapper: delegate to original; delay completion via proxy
-class PozLock(PozEndorserMixin, _ORIG_Lock):  # type: ignore[misc]
-    def __init__(self, *a, **kw):
-        _ORIG_Lock.__init__(self, *a, **kw)
-        PozEndorserMixin.__init__(self)
-
-    async def acquire(self):
+class PozEndorserMixin:
+    """Carries not-before time in loop.time() units; consumed at handoff."""
+    def __init__(self, *a, **k):
+        # super().__init__(*a, **k)
+        self._poz_nb = 0.0
+        
+    def poz_tax(self, delta_ms: float):
         loop = asyncio.get_running_loop()
-        inner_task = loop.create_task(_ORIG_Lock.acquire(self))  # call original
-        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
-        await proxy
-        return True
+        self._poz_nb = max(self._poz_nb, loop.time() + (delta_ms / 1000.0))
+    def poz_not_before(self) -> float:
+        return self._poz_nb
+    def poz_consume(self):
+        self._poz_nb = 0.0
+
+# Lock wrapper
+class PozLock(PozEndorserMixin, asyncio.Lock):  # type: ignore[misc]
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        PozEndorserMixin.__init__(self)
+        
+    async def acquire(self):
+        if not self.locked():
+            return await super().acquire()
+
+        loop = asyncio.get_running_loop()
+        inner = loop.create_future()
+        self._waiters.append(inner)  # standard CPython pattern
+        proxy = _poz_proxy_wait(inner, endorser=self, loop=loop)
+        try:
+            await proxy
+            return await super().acquire()
+        except:
+            if not inner.done():
+                inner.cancel()
+                try: self._waiters.remove(inner)
+                except ValueError: pass
+            raise
 
 # Semaphore wrappers
-class PozSemaphore(PozEndorserMixin, _ORIG_Semaphore):  # type: ignore[misc]
+class PozSemaphore(PozEndorserMixin, asyncio.Semaphore):  # type: ignore[misc]
     def __init__(self, *a, **kw):
-        _ORIG_Semaphore.__init__(self, *a, **kw)
+        super().__init__(*a, **kw)
         PozEndorserMixin.__init__(self)
 
     async def acquire(self):
+        if self._value > 0:
+            self._value -= 1
+            return True
         loop = asyncio.get_running_loop()
-        inner_task = loop.create_task(_ORIG_Semaphore.acquire(self))
-        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
-        await proxy
-        return True
+        inner = loop.create_future()
+        self._waiters.append(inner)
+        proxy = _poz_proxy_wait(inner, endorser=self, loop=loop)
+        try:
+            await proxy
+            return True
+        except:
+            if not inner.done():
+                inner.cancel()
+                try: self._waiters.remove(inner)
+                except ValueError: pass
+            raise
 
-class PozBoundedSemaphore(PozSemaphore, _ORIG_BoundedSemaphore):  # type: ignore[misc]
-    def __init__(self, *a, **kw):
-        _ORIG_BoundedSemaphore.__init__(self, *a, **kw)
-        PozSemaphore.__init__(self, *a, **kw)
+class PozBoundedSemaphore(PozSemaphore, asyncio.BoundedSemaphore):  # type: ignore[misc]
+    pass
 
-# Queue (get/put may suspend): delegate and proxy
-class PozQueue(PozEndorserMixin, _ORIG_Queue):  # type: ignore[misc]
+# Queue (get/put may suspend)
+class PozQueue(PozEndorserMixin, asyncio.Queue):  # type: ignore[misc]
     def __init__(self, *a, **kw):
-        _ORIG_Queue.__init__(self, *a, **kw)
+        super().__init__(*a, **kw)
         PozEndorserMixin.__init__(self)
 
     async def get(self):
-        loop = asyncio.get_running_loop()
-        inner_task = loop.create_task(_ORIG_Queue.get(self))
-        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
-        return await proxy
+        while True:
+            if self.qsize():
+                return super().get_nowait()
+            loop = asyncio.get_running_loop()
+            inner = loop.create_future()
+            self._getters.append(inner)
+            proxy = _poz_proxy_wait(inner, endorser=self, loop=loop)
+            try:
+                item = await proxy
+                return item
+            except:
+                if not inner.done():
+                    inner.cancel()
+                    try: self._getters.remove(inner)
+                    except ValueError: pass
+                raise
 
     async def put(self, item):
-        loop = asyncio.get_running_loop()
-        inner_task = loop.create_task(_ORIG_Queue.put(self, item))
-        proxy = _poz_proxy_from_task(inner_task, endorser=self, loop=loop)
-        await proxy
-        return None
+        while self.full():
+            loop = asyncio.get_running_loop()
+            inner = loop.create_future()
+            self._putters.append(inner)
+            proxy = _poz_proxy_wait(inner, endorser=self, loop=loop)
+            try:
+                await proxy
+            except:
+                if not inner.done():
+                    inner.cancel()
+                    try: self._putters.remove(inner)
+                    except ValueError: pass
+                raise
+        return super().put_nowait(item)
 
 def _patch_lock_sem_queue():
     asyncio.Lock = PozLock
@@ -299,6 +329,7 @@ class PozLoop(asyncio.SelectorEventLoop):
                 return asyncio.Task(coro, loop=loop_)
             async def starter():
                 barrier = getattr(loop_, "_poz_barrier", None)
+                myself = asyncio.current_task()
                 if barrier is not None:
                     await barrier
                 return await coro
@@ -349,17 +380,23 @@ class PozLoop(asyncio.SelectorEventLoop):
 
         # For each OTHER task:
         #  - If suspended on *our* sleep → extend timer by Δ
+        #  - Else if suspended on a wrapped primitive → add Δ to primitive NB
+        #  - Else (I/O waits / runnable): leave alone; they'll resume naturally
         for other in (x for x in asyncio.all_tasks(loop=self) if x is not t and not x.done()):
-            _extend_task_sleep(other, self, self.poz_DELAY * 1000.0)
+            # Try to extend sleeps we own (public-only)
+            if _extend_task_sleep(other, self, self.poz_DELAY * 1000.0):
+                continue
 
-        # Raise NB on all known endorsers (locks/semaphores/queues)
-        for endorser in list(PozEndorserMixin._poz_registry):
-            try:
-                endorser.poz_tax(self.poz_DELAY * 1000.0)
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
+            # If waiting on a user-space primitive we wrapped, its waiter Future
+            # was our inner, but we don't need to touch it here; we just tax the primitive.
+            # We detect this by checking known types the task might be interacting with.
+            # Easiest: scan known endorsers in scope — but we don't track them globally.
+            # Instead, rely on the endorser being applied at *suspension time* via proxy.
+            # So here we set NB on *all* live primitives you care about if you hold refs,
+            # or do nothing and let individual code call .poz_tax when appropriate.
+            # Pragmatically: we can’t enumerate others’ primitives here; we only
+            # endorse waits when they park (handled by proxy).
+            pass
 
         # Arm / extend the gate that holds NEW non-bypass tasks
         barrier = _extend_gate(self, self.poz_DELAY)

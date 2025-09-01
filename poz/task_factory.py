@@ -1,5 +1,6 @@
 from asyncio import BaseEventLoop, tasks, DefaultEventLoopPolicy
 import asyncio
+from typing import Optional
 import contextvars
 import weakref
 import itertools
@@ -12,18 +13,19 @@ _seen_names = set()
 def _create_and_register_name(): 
     name = f"poz-{next(_poz_task_namer)}"
 
-    # TODO: potential for infinite recursion here...
-    # also could become expensive
+    # TODO: could become expensive
+    # also nominally permits infintie recursion though shouldn't
     if name in _seen_names:
         return _create_and_register_name()
 
     _seen_names.add(name)
     return name
 
+# TODO: these should live inside the event loop I think?
 _task_ledger = weakref.WeakKeyDictionary()
-_parent_task_name = contextvars.ContextVar("_parent_task", default=False)
+_parent_task_name = contextvars.ContextVar("_parent_task_name", default=False)
 
-def _install_poz_task_factory(loop: asyncio.AbstractEventLoop | None = None):
+def _install_poz_task_factory(loop: Optional[asyncio.AbstractEventLoop] = None):
     loop = loop or asyncio.get_running_loop()
     prev_task_factory = loop.get_task_factory()
 
