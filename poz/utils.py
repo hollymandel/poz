@@ -56,8 +56,8 @@ def untracked(target):
 
 
 # Cooperative wrappers for common asyncio primitives
-async def sleep(delay, *args, **kwargs):
-    return await _cooperative_await(asyncio.sleep(delay, *args, **kwargs))
+# async def sleep(delay, *args, **kwargs):
+#     return await _cooperative_await(asyncio.sleep(delay, *args, **kwargs))
 
 
 async def gather(*aws, **kwargs):
@@ -80,6 +80,8 @@ async def shield(aw):
 async def lock_acquire(lock: asyncio.Lock):
     return await _cooperative_await(lock.acquire())
 
+async def lock_release(lock: asyncio.Lock):
+    return await _cooperative_await(lock.release())
 
 async def sem_acquire(sem: asyncio.Semaphore):
     return await _cooperative_await(sem.acquire())
