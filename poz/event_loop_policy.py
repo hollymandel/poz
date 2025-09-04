@@ -18,6 +18,7 @@ def _install_asyncio_shims():
 
     # Module-level functions
     def _patch_fn(name, make_wrapper):
+        print(f"patching {name}!")
         if name not in _orig_asyncio_api:
             _orig_asyncio_api[name] = getattr(aio, name)
         orig = _orig_asyncio_api[name]

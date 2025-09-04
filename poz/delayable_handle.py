@@ -1,9 +1,11 @@
 import asyncio
 from collections import defaultdict
 from .task_factory import _parent_task_name
-from .utils import _poz_cooperative, _poz_suspend_start
 
 _poz_ledger = defaultdict(float)
+# Track the moment a virtual speedup was applied to each task's debt.
+# Keyed by Poz task id (name), value is loop.monotonic time.
+_poz_suspended_start = {}
 _orig_run = None
 
 def _install_handle_run_shim():
@@ -23,15 +25,13 @@ def _install_handle_run_shim():
 
         try:
             if debt > 0:
-                # Cooperative credit: if the last suspension was cooperative, reduce
-                # outstanding debt by real time elapsed since suspension started.
-                coop = self._context.get(_poz_cooperative)
+                # Credit elapsed time since the most recent virtual speedup, if any.
                 remaining = debt
-                if coop:
-                    start = self._context.get(_poz_suspend_start)
-                    if start is not None:
-                        elapsed = max(0.0, self._loop.time() - start)
-                        remaining = max(0.0, debt - elapsed)
+
+                debt_start = _poz_suspended_start.get(task_id)
+                if debt_start is not None:
+                    elapsed = max(0.0, self._loop.time() - debt_start)
+                    remaining = max(0.0, debt - elapsed)
 
                 if remaining > 0:
                     # Reschedule on the same loop this handle belongs to
@@ -43,6 +43,8 @@ def _install_handle_run_shim():
         finally:
             # Clear any applied debt for this task (paid by elapsed time or reschedule)
             _poz_ledger[task_id] = 0.0
+            # Also clear any recorded debt start; new speedups will set it again.
+            _poz_suspended_start.pop(task_id, None)
 
     asyncio.Handle._run = _run_shim
 
@@ -57,4 +59,3 @@ def _uninstall_handle_run_shim():
         raise AssertionError("Trying to reset Handle._run but stored value is None, this shouldn't occur")
     
     _orig_run = None
-

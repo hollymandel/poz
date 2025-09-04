@@ -17,7 +17,6 @@ sys.path.append("/Users/hollymandel/poz")
 
 import poz
 
-
 # ---- Helpers ------------------------------------------------------------------
 
 def run_with_poz(coro: "asyncio.Future"):
@@ -95,7 +94,7 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
         print(f"B{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
     async def run_pair(with_speedup: bool): 
-        await poz.untracked(asyncio.gather)(process_a(0), process_b(0, with_speedup))
+        await asyncio.gather(process_a(0), process_b(0, with_speedup))
 
     # Run without speedup then with speedup
     t_baseline = run_with_poz(run_pair(False))
@@ -142,7 +141,7 @@ def test_lock_competition():
                 await asyncio.sleep(0)
                 lock.release()
 
-            await poz.untracked(asyncio.gather)(F(lock), G(lock))
+            await asyncio.gather(F(lock), G(lock))
 
         return run_with_poz(main())
 
@@ -196,7 +195,7 @@ def test_paradoxical_slowdown():
         lock = asyncio.Lock()
         a0 = asyncio.create_task(process_a(0, start, lock))
         b0 = asyncio.create_task(process_b(0, start, lock, with_speedup))
-        await poz.untracked(asyncio.gather)(a0, b0)
+        await asyncio.gather(a0, b0)
 
     print("\n\n\n")
     dt_no_speedup = run_with_poz(main(False))
@@ -286,7 +285,7 @@ def test_suspended_thread():
     async def main(speedup_f):
         start2 = time.time()
         lock = asyncio.Lock()
-        await poz.untracked(asyncio.gather)(F(speedup_f, start2), G(lock, start2), H(lock, start2))
+        await asyncio.gather(F(speedup_f, start2), G(lock, start2), H(lock, start2))
 
     print("\n")
     with_speedup = run_with_poz(main(True))
@@ -296,7 +295,7 @@ def test_suspended_thread():
     print(with_speedup)
     print(without_speedup)
     
-    ratio = with_speedup / (without_speedup + .1)
+    ratio = with_speedup / (without_speedup)
     assert 0.95 < ratio < 1.05
 
 
