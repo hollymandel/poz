@@ -6,6 +6,8 @@ _poz_ledger = defaultdict(float)
 # Track the moment a virtual speedup was applied to each task's debt.
 # Keyed by Poz task id (name), value is loop.monotonic time.
 _poz_suspended_start = {}
+# Track whether the task was in a cooperative await when the window started.
+_poz_suspended_is_coop = {}
 _orig_run = None
 
 def _install_handle_run_shim():
@@ -25,26 +27,33 @@ def _install_handle_run_shim():
 
         try:
             if debt > 0:
-                # Credit elapsed time since the most recent virtual speedup, if any.
-                remaining = debt
-
                 debt_start = _poz_suspended_start.get(task_id)
-                if debt_start is not None:
+                was_coop = _poz_suspended_is_coop.get(task_id, False)
+                if debt_start is None:
+                    # No window recorded; fall back to absolute delay
+                    self._loop.call_later(debt, self._callback, *self._args, context=self._context)
+                elif was_coop:
+                    # Cooperative: give credit since window start
                     elapsed = max(0.0, self._loop.time() - debt_start)
                     remaining = max(0.0, debt - elapsed)
-
-                if remaining > 0:
-                    # Reschedule on the same loop this handle belongs to
-                    self._loop.call_later(remaining, self._callback, *self._args, context=self._context)
+                    if remaining > 0:
+                        self._loop.call_later(remaining, self._callback, *self._args, context=self._context)
+                    else:
+                        _orig_run(self)
                 else:
-                    _orig_run(self)
+                    # Non-cooperative: absolute penalty only during the window
+                    if self._loop.time() < (debt_start + debt):
+                        self._loop.call_later(debt, self._callback, *self._args, context=self._context)
+                    else:
+                        _orig_run(self)
             else:
                 _orig_run(self)
         finally:
             # Clear any applied debt for this task (paid by elapsed time or reschedule)
             _poz_ledger[task_id] = 0.0
-            # Also clear any recorded debt start; new speedups will set it again.
+            # Also clear any recorded window markers; new speedups will set again.
             _poz_suspended_start.pop(task_id, None)
+            _poz_suspended_is_coop.pop(task_id, None)
 
     asyncio.Handle._run = _run_shim
 

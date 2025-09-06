@@ -1,20 +1,11 @@
-from pathlib import Path
-import textwrap
-
-
 import asyncio
 import time
-import sys
-import types
-import inspect
 import contextlib
-from typing import List, Tuple, Callable, Optional
+from typing import List, Tuple
 
 import pytest
 
-import sys
-sys.path.append("/Users/hollymandel/poz")
-
+from utils import *
 import poz
 
 # ---- Helpers ------------------------------------------------------------------
@@ -36,19 +27,6 @@ def run_with_poz(coro: "asyncio.Future"):
 #     for _ in range(max_turns):
 #         await flush_ready_once()
 #         await asyncio.sleep(0)
-
-def cpu_burn_ms(ms: int):
-    """Light CPU burn to simulate CPU-bound work without taking long."""
-    end = time.perf_counter() + (ms / 1000.0)
-    n = 1000
-    s = 0
-    while time.perf_counter() < end:
-        # A small tight loop doing arithmetic to hold the interpreter/GIL.
-        s += sum(i * i for i in range(n))
-    return s
-
-def timer_print(message, start):
-    print(f"[{time.time()-start:0.3f}] {message}")
 
 @contextlib.asynccontextmanager
 async def acquired(lock: asyncio.Lock):

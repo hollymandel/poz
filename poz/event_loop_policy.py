@@ -18,13 +18,11 @@ def _install_asyncio_shims():
 
     # Module-level functions
     def _patch_fn(name, make_wrapper):
-        print(f"patching {name}!")
         if name not in _orig_asyncio_api:
             _orig_asyncio_api[name] = getattr(aio, name)
         orig = _orig_asyncio_api[name]
         setattr(aio, name, make_wrapper(orig))
 
-    # _patch_fn("sleep", lambda orig: (lambda *a, **k: _poz_utils._cooperative_await(orig(*a, **k))))
     _patch_fn("gather", lambda orig: (lambda *a, **k: _poz_utils._cooperative_await(orig(*a, **k))))
     _patch_fn("wait", lambda orig: (lambda *a, **k: _poz_utils._cooperative_await(orig(*a, **k))))
     _patch_fn("wait_for", lambda orig: (lambda *a, **k: _poz_utils._cooperative_await(orig(*a, **k))))

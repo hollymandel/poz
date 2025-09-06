@@ -1,6 +1,6 @@
 import asyncio
-from .delayable_handle import _poz_ledger, _poz_suspended_start
-from .task_factory import _parent_task_name
+from .delayable_handle import _poz_ledger, _poz_suspended_start, _poz_suspended_is_coop
+from .utils import _poz_cooperative_depth
 
 
 def virtual_speedup(delta: float):
@@ -14,4 +14,7 @@ def virtual_speedup(delta: float):
     for other in other_tasks:
         tid = other.get_name()
         _poz_ledger[tid] += delta
+        # Record window start for all tasks to bound penalties in time,
+        # but only mark cooperative tasks to receive elapsed-time credit.
         _poz_suspended_start[tid] = now
+        _poz_suspended_is_coop[tid] = (_poz_cooperative_depth.get(tid, 0) > 0)

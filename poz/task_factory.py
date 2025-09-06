@@ -5,6 +5,7 @@ import contextvars
 import weakref
 import itertools
 import logging
+from .utils import _poz_cooperative_depth
 
 # Guard against multiple imports: preserve existing registries
 try:  # type: ignore[name-defined]
@@ -64,7 +65,9 @@ def _install_poz_task_factory(loop: Optional[asyncio.AbstractEventLoop] = None):
             # clean _seen_names to speed lookups
             # mark the cleanup callback so the poz handle shim can ignore it
             def _poz_cleanup_cb(t):
-                _seen_names.discard(t.get_name())
+                name = t.get_name()
+                _seen_names.discard(name)
+                _poz_cooperative_depth.pop(name, None)
 
             # Mark as internal so delay shim won't treat it as user work
             _poz_cleanup_cb._poz_internal = True  # type: ignore[attr-defined]
