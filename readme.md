@@ -51,6 +51,7 @@ TODO:
 - PENALIZE_ONCE.discard issue!! 
 - thread safety (call_soon_threadsafe)
 - cancelled task handling?
+- keep track of parentage and remove delay penalty from parents (but not siblings)
 
 Traceback (most recent call last):
   File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/events.py", line 80, in _run

@@ -1,8 +1,11 @@
 import asyncio
+import time
 from collections import defaultdict
 from .task_factory import _parent_task_name
+from .cooperatives import _poz_cooperative
 
 _poz_ledger = defaultdict(float)
+_speedup_time = [-1]
 _orig_run = None
 
 def _install_handle_run_shim():
@@ -10,7 +13,9 @@ def _install_handle_run_shim():
     _orig_run = asyncio.Handle._run
 
     def _run_shim(self):
+        
         task_id = self._context.get(_parent_task_name)
+        is_cooperative = self._context.get(_poz_cooperative)
         is_internal = getattr(self._callback, "_poz_internal", False)
 
         # If we can't attribute this handle to a poz-tracked task, or it's an
@@ -23,9 +28,19 @@ def _install_handle_run_shim():
         try:
             if debt <= 0:
                 _orig_run(self)
+            elif is_cooperative:
+                print("is cooperative!")
+                now = time.perf_counter()
+                if (now - _speedup_time[0]) < debt:
+                    remaining_debt = debt - (now - _speedup_time[0])
+                    print(f"Rescheduling {self._callback} for {remaining_debt} seconds!")
+                    self._loop.call_later(debt, self._callback, *self._args, context=self._context)   
+                else:
+                    print(f"Debt exceeded, not rescheduling {self._callback}")
+                    _orig_run(self)
             else:
                 # Reschedule on the same loop this handle belongs to
-                print(f"[Rescheduling {self._callback} for {debt} seconds")
+                print(f"Rescheduling {self._callback} for {debt} seconds")
                 self._loop.call_later(debt, self._callback, *self._args, context=self._context)
         finally:
             # Decrement any applied debt for this task. If we didn't reschedule,

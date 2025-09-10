@@ -43,3 +43,37 @@ def untracked(target):
         return wrapper
 
     raise TypeError("untracked expects a callable or awaitable")
+
+
+
+def untracked(target):
+    """Run an awaitable/callable such that Poz won't delay its resume.
+
+    - One-liner: await poz.untracked(awaitable)
+    - Decorator: @poz.untracked
+    """
+    # One-liner form: passed an awaitable
+    if inspect.isawaitable(target):
+        async def runner():
+            tok = _parent_task_name.set(False)
+            try:
+                return await target
+            finally:
+                _parent_task_name.reset(tok)
+        return runner()
+
+    # Decorator form: passed a callable
+    if callable(target):
+        @functools.wraps(target)
+        async def wrapper(*args, **kwargs):
+            tok = _parent_task_name.set(False)
+            try:
+                res = target(*args, **kwargs)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+            finally:
+                _parent_task_name.reset(tok)
+        return wrapper
+
+    raise TypeError("untracked expects a callable or awaitable")

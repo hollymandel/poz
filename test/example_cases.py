@@ -1,22 +1,12 @@
-from pathlib import Path
-import textwrap
-
-
 import asyncio
 import time
-import sys
-import types
-import inspect
 import contextlib
-from typing import List, Tuple, Callable, Optional
+from typing import List, Tuple
 
 import pytest
 
-import sys
-sys.path.append("/Users/hollymandel/poz")
-
+from utils import *
 import poz
-
 
 # ---- Helpers ------------------------------------------------------------------
 
@@ -38,26 +28,6 @@ def run_with_poz(coro: "asyncio.Future"):
 #         await flush_ready_once()
 #         await asyncio.sleep(0)
 
-def cpu_burn_ms(ms: int):
-    """Light CPU burn to simulate CPU-bound work without taking long."""
-    end = time.perf_counter() + (ms / 1000.0)
-    n = 1000
-    s = 0
-    while time.perf_counter() < end:
-        # A small tight loop doing arithmetic to hold the interpreter/GIL.
-        s += sum(i * i for i in range(n))
-    return s
-
-def timer_print(message, start):
-    print(f"[{time.time()-start:0.3f}] {message}")
-
-@contextlib.asynccontextmanager
-async def acquired(lock: asyncio.Lock):
-    await lock.acquire()
-    try:
-        yield
-    finally:
-        lock.release()
 
 
 def order_from_lines(lines: List[str], prefixes: Tuple[str, ...]) -> List[str]:
@@ -95,7 +65,7 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
         print(f"B{i} done, elapsed {(time.perf_counter()-t0):0.3f}s")
 
     async def run_pair(with_speedup: bool): 
-        await poz.untracked(asyncio.gather)(process_a(0), process_b(0, with_speedup))
+        await asyncio.gather(process_a(0), process_b(0, with_speedup))
 
     # Run without speedup then with speedup
     t_baseline = run_with_poz(run_pair(False))
@@ -112,41 +82,51 @@ def test_cpu_bound_virtual_speedup_has_no_effect_on_cpu_runtime():
 #     coro should have an effect, speeding the suspended coro should not.
 def test_lock_competition():
     def _run_once(f_speedup: bool, g_speedup: bool) -> float:
+        start = time.time()
         async def main():
             # Create the lock inside the running PozLoop so it's bound correctly
             lock = asyncio.Lock()
 
-            async def F():
-                await asyncio.sleep(0)
-                async with lock:
-                    print("F has the lock")
-                    if f_speedup:
-                        poz.virtual_speedup(.1) 
-                    cpu_burn_ms(100)
-                    await asyncio.sleep(0)
+            async def F(lock):
+                # async with lock:
+                timer_print("F starting", start)
+                await lock.acquire()
+                timer_print("F has the lock", start)
 
-            async def G():
+                await asyncio.sleep(0.001)
+                if f_speedup:
+                    poz.virtual_speedup(.1) 
+                    timer_print("F speedup", start)
+                cpu_burn_ms(100)
+                lock.release()
                 await asyncio.sleep(0)
-                print("G launched")
+
+            async def G(lock):
+                timer_print("G launched", start)
                 if g_speedup:
                     poz.virtual_speedup(.1) 
-                async with lock:
-                    print("G has the lock")
-                    cpu_burn_ms(100)
-                    await asyncio.sleep(0)
+                    timer_print("G speedup", start)
+                await lock.acquire()
+                timer_print("G has the lock", start)
+                cpu_burn_ms(100)
+                await asyncio.sleep(0)
+                lock.release()
 
-            await poz.untracked(asyncio.gather)(F(), G())
+            await asyncio.gather(F(lock), G(lock))
 
         return run_with_poz(main())
 
     t_no_speedup = _run_once(False, False)
+    print("\n\n\n")
     t_f_speedup  = _run_once(True,  False)
+
+    print("\n\n\n")
     t_g_speedup  = _run_once(False, True)
 
     print(f"t_no_speedup={t_no_speedup} t_f_speedup={t_f_speedup} t_g_speedup={t_g_speedup}")
 
     f_speedup_ratio = t_f_speedup / t_no_speedup if t_no_speedup > 1e-6 else -1
-    g_speedup_ratio = t_g_speedup / (t_no_speedup+1) if t_no_speedup > 1e-6 else -1
+    g_speedup_ratio = t_g_speedup / (t_no_speedup+.1) if t_no_speedup > 1e-6 else -1
 
     assert 0.95 < f_speedup_ratio < 1.05
     assert 0.95 < g_speedup_ratio < 1.05
@@ -186,9 +166,11 @@ def test_paradoxical_slowdown():
         lock = asyncio.Lock()
         a0 = asyncio.create_task(process_a(0, start, lock))
         b0 = asyncio.create_task(process_b(0, start, lock, with_speedup))
-        await poz.untracked(asyncio.gather)(a0, b0)
+        await asyncio.gather(a0, b0)
 
+    print("\n\n\n")
     dt_no_speedup = run_with_poz(main(False))
+    print("\n\n\n")
     dt_speedup = run_with_poz(main(True))
     
     assert 0.95 < (dt_no_speedup/1.2) < 1.05
@@ -272,10 +254,9 @@ def test_suspended_thread():
             timer_print("H released lock", start)
 
     async def main(speedup_f):
-        start = time.perf_counter()
         start2 = time.time()
         lock = asyncio.Lock()
-        await poz.untracked(asyncio.gather)(F(speedup_f, start2), G(lock, start2), H(lock, start2))
+        await asyncio.gather(F(speedup_f, start2), G(lock, start2), H(lock, start2))
 
     print("\n")
     with_speedup = run_with_poz(main(True))
@@ -285,7 +266,6 @@ def test_suspended_thread():
     print(with_speedup)
     print(without_speedup)
     
-    ratio = with_speedup / (without_speedup + .1)
+    ratio = with_speedup / (without_speedup)
     assert 0.95 < ratio < 1.05
-
 
