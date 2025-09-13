@@ -29,7 +29,7 @@ def _install_handle_run_shim():
             if debt <= 0:
                 _orig_run(self)
             elif is_cooperative:
-                print("is cooperative!")
+                print(f"{task_id} found to be cooperative")
                 now = time.perf_counter()
                 if (now - _speedup_time[0]) < debt:
                     remaining_debt = debt - (now - _speedup_time[0])

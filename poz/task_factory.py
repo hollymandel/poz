@@ -5,6 +5,8 @@ import contextvars
 import weakref
 import itertools
 import logging
+from .cooperatives import _poz_cooperative
+from .cooperatives import _poz_cooperative
 
 # Guard against multiple imports: preserve existing registries
 try:  # type: ignore[name-defined]
@@ -44,22 +46,30 @@ def _install_poz_task_factory(loop: Optional[asyncio.AbstractEventLoop] = None):
             _seen_names.add(task_id)
         else:
             task_id = _create_and_register_name()
-
+        print(f"scheduling {task_id}")
         # inject task_id into context so that it will be captured by child callbacks. Can't
         # use the task itself as an identifier because context is captured during task instantiation.
         try:
             if context is not None:
                 ctx = context.copy()
-                ctx.run(lambda: _parent_task_name.set(task_id))
+
+                def _init_ctx():
+                    _parent_task_name.set(task_id)
+                    # Ensure new tasks never inherit a cooperative tag
+                    _poz_cooperative.set(False)
+
+                ctx.run(_init_ctx)
                 task = (prev_task_factory(loop, coro, context=ctx, name=task_id)
                         if prev_task_factory else asyncio.tasks.Task(coro, loop=loop, context=ctx, name=task_id))
             else:
-                tok = _parent_task_name.set(task_id)
+                tok_name = _parent_task_name.set(task_id)
+                tok_coop = _poz_cooperative.set(False)
                 try:
                     task = (prev_task_factory(loop, coro, name=task_id)
                             if prev_task_factory else asyncio.tasks.Task(coro, loop=loop, name=task_id))
                 finally:
-                    _parent_task_name.reset(tok)
+                    _poz_cooperative.reset(tok_coop)
+                    _parent_task_name.reset(tok_name)
 
             # clean _seen_names to speed lookups
             # mark the cleanup callback so the poz handle shim can ignore it
